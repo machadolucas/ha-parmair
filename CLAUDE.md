@@ -40,7 +40,7 @@ via HACS from `machadolucas/ha-parmair`.
 | `coordinator.py` | HA | `ParmairCoordinator`: block reads, static-once reads, partial-failure tolerance, write + optimistic update + delayed verify-read, repairs, summer-auto evaluation |
 | `config_flow.py` | HA | user → probe → confirm; options (scan interval, CO₂ offset, summer-auto source, re-detect) |
 | platforms | HA | thin description-driven entity files over `entity.ParmairEntity` |
-| `frontend/parmair-card.js` | JS | self-contained card + editor; registered from `__init__.py` (static path + Lovelace resource registry, best-effort) |
+| `frontend/parmair-card.js` | JS | self-contained card + editor; registered from `__init__.py` (static path + Lovelace resource registry, best-effort). Renders in **shadow DOM** with the stylesheet injected once — a light-DOM `<style>` re-injected per render leaked rules to sibling cards and stalled dashboard paint (v0.2.1 fix); responsive stacking via ResizeObserver, NOT `@container` |
 
 Rules:
 
