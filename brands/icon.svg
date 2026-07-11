@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Stylized HRV fan: four swept blades around a hub, in Parmair-ish blue. -->
+  <circle cx="128" cy="128" r="120" fill="#1273b8"/>
+  <g fill="#ffffff">
+    <path d="M128 40c30 0 44 18 44 38 0 16-10 28-28 34a48 48 0 0 0-16-4V40z"/>
+    <path d="M216 128c0 30-18 44-38 44-16 0-28-10-34-28a48 48 0 0 0 4-16h68z"/>
+    <path d="M128 216c-30 0-44-18-44-38 0-16 10-28 28-34a48 48 0 0 0 16 4v68z"/>
+    <path d="M40 128c0-30 18-44 38-44 16 0 28 10 34 28a48 48 0 0 0-4 16H40z"/>
+    <circle cx="128" cy="128" r="18"/>
+  </g>
+</svg>

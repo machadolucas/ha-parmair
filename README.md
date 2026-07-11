@@ -1,0 +1,210 @@
+# Parmair MAC for Home Assistant
+
+Local Home Assistant integration for **Parmair MAC** ventilation / heat-recovery
+units (My Air Control, Multi24 controller) over **Modbus TCP** — with full
+UI configuration, automatic feature detection, a proper `fan` entity, and a
+bundled compact Lovelace card.
+
+Developed and tested against a **Parmair REXO 120 MAC** (register map v1.87).
+Not affiliated with or endorsed by Parmair Oy.
+
+## Features
+
+- **UI configuration** — enter host + port, the integration probes the unit,
+  detects its features and shows what it found before creating anything.
+- **Feature detection** — entities are only created for hardware your unit
+  actually has: CO₂ sensor, wet-room humidity sensor, post-heater type
+  (water/electric), M12 input usage. Absent sensors (which read `-1` over
+  Modbus) never appear as dead entities.
+- **A real `fan` entity** — speed 1–5 as percentage steps, plus preset modes
+  *Home / Away / Boost / Fireplace*, and on/off. No more template fans and
+  register-writing automations.
+- **Two `climate` entities** for the supply and extract (summer) temperature
+  setpoints, with live current temperature and heating/cooling action.
+- **Switches** for boost, fireplace mode, summer mode, HRU temperature
+  control and post-heating; **numbers** and **selects** for the useful
+  settings (default speeds, boost duration, CO₂/humidity boost limits,
+  defrost tuning, filter interval…).
+- **Summer mode automation** (optional): turn summer mode on/off
+  automatically when a temperature stays above/below your thresholds for a
+  dwell time you choose. Uses the unit's own fresh-air sensor or any
+  temperature entity you pick.
+- **~75 entities** total; low-value diagnostics are disabled by default so
+  they don't clutter your setup — enable the ones you want.
+- **Repairs integration** — filter change due, active alarms and lost
+  connection raise Home Assistant repair issues; alarms can be acknowledged
+  with a button entity.
+- **Diagnostics download** (host redacted) with the raw register snapshot,
+  read plan and failure counters for easy bug reports.
+- **Bundled Lovelace card** — a compact ventilation control card,
+  configurable in the UI, auto-registered (no manual resource setup).
+
+## Supported hardware
+
+Parmair MAC family units with the Multi24 controller exposing the **v1.87
+Modbus register map** (spec "Modbus Parmair" V1.87, registers 1–245). The
+integration verifies the map during setup and refuses units it does not
+recognize rather than creating garbage entities. The register-map layer is
+pluggable, so other firmware families can be added — PRs welcome.
+
+Connection facts the integration handles for you (useful to know when
+debugging):
+
+- On-wire holding-register address = spec register number + 1000
+  (`IV01_CONTROLSTATE_FO`, register 185, lives at address 1185).
+- Modbus **unit id 0**.
+- The controller is slow: transactions are serialized, paced ≥ 0.3 s apart
+  and retried with reconnects. Values are polled in a handful of bulk block
+  reads (default every 10 s).
+- ⚠ The Multi24's TCP stack misbehaves with **multiple simultaneous Modbus
+  clients** (responses can leak between connections). Remove any other
+  Modbus integration/poller for the unit before setting this one up.
+
+## Installation
+
+### HACS (custom repository)
+
+1. HACS → ⋮ → *Custom repositories* → add
+   `machadolucas/ha-parmair` with category **Integration**.
+2. Install **Parmair MAC**, restart Home Assistant.
+3. Settings → Devices & services → *Add integration* → **Parmair MAC**.
+
+### Manual
+
+Copy `custom_components/parmair/` into your Home Assistant `config/custom_components/`
+directory and restart.
+
+## Configuration
+
+The config flow asks for:
+
+| Field | Default | Notes |
+|---|---|---|
+| Host | — | IP/hostname of the unit |
+| Port | 502 | Modbus TCP port |
+| Name | Parmair | Device name |
+| Scan interval | 10 s | Polling period (5–120 s) |
+
+The integration then connects, validates the register map, detects features
+and shows a confirmation screen (model, software version, detected sensors)
+before creating the entry.
+
+**Options** (Settings → Devices & services → Parmair MAC → *Configure*):
+
+- **Scan interval** — polling period.
+- **CO₂ offset** — calibration added to the raw CO₂ reading. Some CO₂
+  transmitters report with a fixed bias; compare the panel reading with the
+  `Carbon dioxide` sensor and set the difference here (can be negative).
+- **Summer auto temperature source** — the temperature entity that drives
+  the summer-mode automation. Empty = the unit's own fresh-air sensor.
+- **Re-detect device features** — re-probe the unit after hardware changes
+  (e.g. a CO₂ sensor was installed).
+
+### Summer mode automation
+
+The unit's built-in summer-mode logic is a simple outdoor-temperature limit.
+This integration adds an optional dwell-based automation on top:
+
+1. Turn on the **Summer mode automation** switch.
+2. Set the four numbers: *on temperature* / *on dwell time* (summer mode
+   turns ON after the source temperature stays ≥ threshold for the dwell)
+   and *off temperature* / *off dwell time* (mirror image).
+
+Manual toggles of the **Summer mode** switch are never blocked; the
+automation re-asserts its decision only after the opposite dwell completes.
+
+## Entities
+
+The most important ones (all names are translatable / renameable):
+
+| Entity | What it is |
+|---|---|
+| `fan.<device>` | Main control: speed 1–5 (20 % steps), presets Home/Away/Boost/Fireplace, on/off |
+| `climate.<device>_supply_temperature` | Supply air setpoint (15–25 °C) with current temperature |
+| `climate.<device>_extract_temperature_summer` | Extract setpoint used in summer (18–26 °C) |
+| `switch.*` boost / fireplace / summer mode | The three modes as simple switches (boost/fireplace show remaining minutes as sensors) |
+| `sensor.*` temperatures | Fresh, supply (before/after HRU), extract, waste |
+| `sensor.*` air quality | Humidity (HRU + 24 h average), CO₂ (if fitted), heat-recovery efficiency |
+| `binary_sensor.*` | Defrosting, home/away, filter change required, alarm |
+| `button.*` | Acknowledge alarms, mark filter changed (stamps today's date) |
+| `number.*` / `select.*` | Default speeds when home/away, boost duration/speed, CO₂ & humidity boost limits, defrost tuning, filter interval… |
+
+Diagnostic sensors (fan outputs, defrost internals, fault codes per sensor,
+timers…) exist but many are **disabled by default** — enable them from the
+device page if you need them.
+
+## Lovelace card
+
+The integration serves and registers `parmair-card` automatically. Add it
+from the card picker ("Parmair Card") or via YAML:
+
+```yaml
+type: custom:parmair-card
+# All optional:
+device_id: <your parmair device>   # auto-detected when you have one unit
+title: Ventilation
+show_fan_row: true
+show_temperatures: true
+show_chips: true
+show_alerts: true
+compact: false
+```
+
+The card shows power + status (defrost/summer/heating), a speed selector
+(Auto · 1–5), Boost/Fireplace/Summer chips with countdown badges,
+temperature flows (fresh→supply, extract→waste), efficiency/humidity/CO₂
+chips, and a filter/alarm banner with tap-to-acknowledge. It follows entity
+renames automatically (it resolves entities via the registry, not by id).
+
+## Migrating from the built-in `modbus:` integration
+
+If you previously integrated the unit with HA's built-in Modbus YAML:
+
+1. **Remove the `modbus:` YAML** (or at least this unit's hub) and restart —
+   the Multi24 does not reliably serve two clients.
+2. Add this integration.
+3. Old automations keep working if you rename the new entities to your old
+   entity ids (Settings → entities → rename), or update the automations to
+   the new ids. Registers you used to write directly map to entities:
+   register 1187 → `fan` speed, 1185 → `fan` presets / boost & fireplace
+   switches, 1208 → `fan` on/off, 1104/1105 → *Speed when home/away*
+   numbers, 1097 → *Defrost minimum efficiency* number.
+
+Note: *Speed when home/away* display speeds 1–5 while the device stores 0–4
+internally — the integration handles the offset (matches the panel).
+
+## Troubleshooting
+
+- **cannot_connect** — check IP/port 502, VLAN/firewall rules, and that no
+  other Modbus client is connected to the unit.
+- **not_parmair** — the device answered but the register map didn't match
+  (machine type / software version implausible). Open an issue with your
+  unit model and, if possible, a register dump.
+- **Entities unavailable after working** — the integration retries and
+  reconnects automatically; a *connection lost* repair issue appears after
+  ~5 failed cycles. Check the network path and other Modbus clients.
+- **CO₂ looks ~500 ppm too high/low** — set the CO₂ offset option (see
+  above).
+- Download **diagnostics** from the device page and attach it to bug
+  reports (the host is redacted).
+
+## Development
+
+```bash
+uv venv --python 3.13 .venv313
+uv pip install --python .venv313/bin/python -r requirements_test.txt
+.venv313/bin/python -m pytest --cov=custom_components/parmair --cov-fail-under=90
+.venv313/bin/ruff check . && .venv313/bin/ruff format --check .
+```
+
+Pure logic (register map, capability detection, summer-mode state machine)
+lives in HA-free modules with plain pytest tests; HA behavior is tested with
+`pytest-homeassistant-custom-component` against a fake Modbus client seeded
+with values captured from a real REXO 120. See `CLAUDE.md` for architecture
+notes and contribution conventions.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Parmair, My Air Control and MAC are trademarks
+of their respective owners; this project is an independent community
+integration.

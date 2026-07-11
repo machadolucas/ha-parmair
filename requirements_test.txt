@@ -1,0 +1,9 @@
+# Test + lint dependencies (CI). The pure-module tests need only pytest;
+# pytest-homeassistant-custom-component pulls Home Assistant for the HA-side
+# tests. pymodbus is a runtime requirement of the integration itself (modbus.py
+# imports it), so the HA test suite needs it installed too.
+pytest>=8.0
+pytest-cov>=5.0
+pytest-homeassistant-custom-component
+pymodbus>=3.11.0
+ruff>=0.6
