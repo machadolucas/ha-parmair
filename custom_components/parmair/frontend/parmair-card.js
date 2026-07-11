@@ -81,7 +81,6 @@ function registerCard(card) {
 
 const CARD_CSS = `
   ha-card { padding: 0; overflow: hidden; }
-  .card-wrap { container-type: inline-size; }
 
   .header { display: flex; align-items: center; gap: 8px; padding: 12px 14px; }
   .title { flex: 1 1 auto; font-weight: 600; font-size: 1em; min-width: 0; overflow: hidden;
@@ -109,8 +108,7 @@ const CARD_CSS = `
 
   .body-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 2px 14px 12px; }
   .body-grid.single { grid-template-columns: 1fr; }
-  @container (max-width: 440px) { .body-grid { grid-template-columns: 1fr; } }
-  @media (max-width: 440px) { .body-grid { grid-template-columns: 1fr; } }
+  .narrow .body-grid { grid-template-columns: 1fr; }
 
   .panel { background: var(--secondary-background-color, rgba(127,127,127,0.08));
     border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
@@ -563,16 +561,41 @@ class ParmairCard extends HTMLElement {
   _render() {
     if (!this._hass || !this._config) return;
     if (!this._card) {
+      // Shadow DOM keeps CARD_CSS fully scoped (a light-DOM <style> would
+      // leak rules like `ha-card {}` to sibling cards in the same section),
+      // and the style element is created ONCE — re-injecting it on every
+      // hass tick forces a full restyle pass and can stall dashboard paint.
+      const shadow = this.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = CARD_CSS;
+      shadow.appendChild(style);
       this._card = document.createElement("ha-card");
-      this.appendChild(this._card);
+      shadow.appendChild(this._card);
       this._card.addEventListener("click", (e) => this._onClick(e));
+      // Responsive stacking via ResizeObserver instead of a container query:
+      // `container-type: inline-size` inside the sections grid can create a
+      // layout feedback loop (observed as minutes-long blank paints).
+      this._resizeObserver = new ResizeObserver((entries) => {
+        const width = entries[0]?.contentRect?.width || 0;
+        this._card.classList.toggle("narrow", width > 0 && width < 440);
+      });
+      this._resizeObserver.observe(this._card);
     }
     if (this._forceNextRender) {
       this._forceNextRender = false;
     } else if (!this._shouldRender()) {
       return;
     }
-    this._card.innerHTML = `<style>${CARD_CSS}</style>${this._bodyHtml()}`;
+    this._card.innerHTML = this._bodyHtml();
+  }
+
+  disconnectedCallback() {
+    clearTimeout(this._pwrRevertTimer);
+    if (this._resizeObserver) this._resizeObserver.disconnect();
+  }
+
+  connectedCallback() {
+    if (this._resizeObserver && this._card) this._resizeObserver.observe(this._card);
   }
 
   // Interaction-driven UI state (the power-button confirmation) doesn't come
