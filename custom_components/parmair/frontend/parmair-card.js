@@ -23,20 +23,21 @@
  *                 supply_temperature_after_hru, heat_recovery_efficiency,
  *                 hru_humidity, co2, boost_time_remaining,
  *                 fireplace_time_remaining, fan_speed_state, control_state,
- *                 filter_next_change, temperature_mode
- *   binary_sensor.* defrosting, filter_change_required, alarm
+ *                 filter_next_change
+ *   binary_sensor.* defrosting, filter_change_required, alarm, home
  *   switch.*      boost, fireplace, summer_mode, summer_auto,
  *                 hru_temperature_control, post_heating
  *   select.*      boost_duration, fireplace_duration
- *   number.*      home_speed, away_speed
+ *   number.*      home_speed, away_speed, defrost_min_efficiency
  *   climate.*     supply_temperature_target, extract_temperature_target
  *   button.*      acknowledge_alarms
  *
  * Layout: a chromeless "split panel" card — header (title, live chips,
- * status badge, expand button), a controls panel (speed stepper, Boost,
+ * status chips, expand button), a controls panel (speed stepper, Boost,
  * Fireplace) beside an airflow panel (cross-flow SVG diagram), an
  * expandable settings section (power, home/away speeds, temperature
- * targets, mode toggles), stacking to a single column on narrow cards.
+ * targets, defrost efficiency, mode toggles), stacking to a single column
+ * on narrow cards.
  *
  * Two custom elements: `parmair-card` (the card itself) and
  * `parmair-card-editor` (its visual editor), both registered against
@@ -96,9 +97,11 @@ function registerCard(card) {
  * widths — is inline in the markup instead.
  */
 const CARD_CSS = `
-  ha-card { background: none; border: none; box-shadow: none; padding: 0; overflow: visible; }
+  :host { display: block; }
+  .root { background: none; border: none; outline: none; box-shadow: none; padding: 0; margin: 0; }
   button { font-family: inherit; }
   button:disabled { opacity: 0.5; pointer-events: none; }
+  [data-more-info] { cursor: pointer; }
 
   .header { display: flex; align-items: center; gap: 6px; padding: 0 2px 8px; }
   .title { flex: 0 1 auto; font-weight: 600; font-size: 1em; min-width: 0; overflow: hidden;
@@ -110,14 +113,10 @@ const CARD_CSS = `
     background: color-mix(in srgb, var(--primary-text-color) 6%, transparent);
     color: var(--secondary-text-color); }
   .hchip ha-icon { --mdc-icon-size: 13px; }
-
-  .badge { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; font-size: 0.76em;
-    font-weight: 600; padding: 3px 9px; border-radius: 10px; white-space: nowrap; }
-  .badge ha-icon { --mdc-icon-size: 14px; }
-  .badge-cold { background: color-mix(in srgb, #2196f3 20%, transparent); color: #2196f3; }
-  .badge-summer { background: color-mix(in srgb, #ff9800 20%, transparent); color: #ff9800; }
-  .badge-heat { background: color-mix(in srgb, var(--error-color, #db4437) 18%, transparent);
-    color: var(--error-color, #db4437); }
+  .hchip.icon-only { padding: 3px 6px; }
+  .hchip.chip-summer { background: color-mix(in srgb, #ff9800 20%, transparent); color: #ff9800; }
+  .hchip.chip-cold { background: color-mix(in srgb, #2196f3 20%, transparent); color: #2196f3; }
+  .hchip.chip-dim { opacity: 0.55; }
   .auto-dot { margin-left: 2px; font-size: 0.85em; opacity: 0.9; }
 
   .more-btn { flex: 0 0 auto; width: 30px; height: 30px; border-radius: 50%; border: none;
@@ -203,6 +202,7 @@ const CARD_CSS = `
     background: color-mix(in srgb, var(--primary-text-color) 6%, transparent); }
   .narrow .more-grid { grid-template-columns: 1fr; }
   .set-row { display: flex; align-items: center; gap: 8px; min-height: 34px; }
+  .set-row.full { grid-column: 1 / -1; }
   .set-label { flex: 1 1 auto; font-size: 0.82em; color: var(--secondary-text-color); min-width: 0;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .set-value { min-width: 40px; text-align: center; font-size: 0.92em; font-weight: 600;
@@ -392,49 +392,69 @@ class ParmairCard extends HTMLElement {
 
   // ---- rendering: header ---------------------------------------------------
 
-  _badgeHtml() {
-    if (this._isOn("defrosting")) {
-      return `<span class="badge badge-cold"><ha-icon icon="mdi:snowflake"></ha-icon>Defrosting</span>`;
-    }
-    if (this._isOn("summer_mode")) {
-      const auto = this._isOn("summer_auto")
-        ? `<span class="auto-dot" title="Automatic">ᴬ</span>`
-        : "";
-      return `<span class="badge badge-summer"><ha-icon icon="mdi:weather-sunny"></ha-icon>Summer${auto}</span>`;
-    }
-    if (this._raw("temperature_mode") === "heating") {
-      return `<span class="badge badge-heat"><ha-icon icon="mdi:radiator"></ha-icon>Heating</span>`;
-    }
-    return "";
-  }
-
   // Compact live-value chips right after the title: fan power, humidity,
   // CO₂ — icon + value only, each rendered only when its entity exists.
+  // Clicking a chip opens more-info for its entity (the fan-power chip
+  // opens the fan itself, the most useful target for that number).
   _headerChipsHtml() {
     const chips = [];
     if (this._has("fan_speed_state")) {
       const speed = this._speedNumber();
-      chips.push({ icon: "mdi:fan", value: speed == null ? "–" : `${fmt0(speed * 20)}%` });
+      chips.push({ icon: "mdi:fan", value: speed == null ? "–" : `${fmt0(speed * 20)}%`, key: "fan", tip: "Fan power" });
     }
     if (this._has("hru_humidity")) {
-      chips.push({ icon: "mdi:water-percent", value: `${fmt0(this._raw("hru_humidity"))}%` });
+      chips.push({ icon: "mdi:water-percent", value: `${fmt0(this._raw("hru_humidity"))}%`, key: "hru_humidity", tip: "Humidity" });
     }
     if (this._has("co2")) {
-      chips.push({ icon: "mdi:molecule-co2", value: fmt0(this._raw("co2")) });
+      chips.push({ icon: "mdi:molecule-co2", value: fmt0(this._raw("co2")), key: "co2", tip: "CO₂ (ppm)" });
     }
-    if (!chips.length) return `<span class="hchips"></span>`;
-    const html = chips
-      .map((c) => `<span class="hchip"><ha-icon icon="${c.icon}"></ha-icon>${c.value}</span>`)
+    return chips
+      .map((c) => `<span class="hchip" data-more-info="${c.key}" title="${esc(c.tip)}"><ha-icon icon="${c.icon}"></ha-icon>${c.value}</span>`)
       .join("");
-    return `<span class="hchips">${html}</span>`;
+  }
+
+  _iconChipHtml(key, icon, tip, extraClass) {
+    return `<span class="hchip icon-only${extraClass ? ` ${extraClass}` : ""}" data-more-info="${key}" title="${esc(tip)}"><ha-icon icon="${icon}"></ha-icon></span>`;
+  }
+
+  // Mode/status chips between the value chips and the more-button. The
+  // Summer chip keeps its label; the rest are icon-only with a tooltip and
+  // only appear while their state is on — except the home/away chip, which
+  // is always shown (dimmed when away).
+  _statusChipsHtml() {
+    const chips = [];
+    if (this._isOn("summer_mode")) {
+      const auto = this._isOn("summer_auto")
+        ? `<span class="auto-dot" title="Automatic">ᴬ</span>`
+        : "";
+      chips.push(
+        `<span class="hchip chip-summer" data-more-info="summer_mode" title="Summer mode"><ha-icon icon="mdi:weather-sunny"></ha-icon>Summer${auto}</span>`,
+      );
+    }
+    if (this._isOn("hru_temperature_control")) {
+      chips.push(this._iconChipHtml("hru_temperature_control", "mdi:home-thermometer", "HRU temperature control", ""));
+    }
+    if (this._isOn("post_heating")) {
+      chips.push(this._iconChipHtml("post_heating", "mdi:radiator", "Post-heating", ""));
+    }
+    if (this._isOn("defrosting")) {
+      chips.push(this._iconChipHtml("defrosting", "mdi:snowflake", "Defrosting", "chip-cold"));
+    }
+    if (this._has("home")) {
+      const home = this._isOn("home");
+      chips.push(
+        this._iconChipHtml("home", home ? "mdi:home" : "mdi:home-export-outline", home ? "Home" : "Away", home ? "" : "chip-dim"),
+      );
+    }
+    return chips.join("");
   }
 
   _headerHtml() {
     const title = this._config.title || "Ventilation";
     return `<div class="header">
       <span class="title" data-action="title">${esc(title)}</span>
-      ${this._headerChipsHtml()}
-      ${this._badgeHtml()}
+      <span class="hchips">${this._headerChipsHtml()}</span>
+      ${this._statusChipsHtml()}
       <button type="button" class="more-btn${this._expanded ? " open" : ""}" data-action="more"
         aria-label="${this._expanded ? "Hide settings" : "Show settings"}" aria-expanded="${this._expanded}">
         <ha-icon icon="${this._expanded ? "mdi:chevron-up" : "mdi:dots-horizontal"}"></ha-icon>
@@ -499,8 +519,8 @@ class ParmairCard extends HTMLElement {
     const cfg = this._config;
     const parts = [];
     if (cfg.show_fan_row) parts.push(this._speedRowHtml());
-    parts.push(this._actionButtonHtml("boost", "mdi:fan-plus", "Boost", "boost_time_remaining", "boost_duration", 180, "accent-boost"));
-    parts.push(this._actionButtonHtml("fireplace", "mdi:fireplace", "Fireplace", "fireplace_time_remaining", "fireplace_duration", 15, "accent-fireplace"));
+    parts.push(this._actionButtonHtml("boost", "mdi:fan-plus", "Boost mode", "boost_time_remaining", "boost_duration", 180, "accent-boost"));
+    parts.push(this._actionButtonHtml("fireplace", "mdi:fireplace", "Fireplace mode", "fireplace_time_remaining", "fireplace_duration", 15, "accent-fireplace"));
     const dimmed = !this._isOn("fan") ? " dimmed" : "";
     return `<div class="panel controls-panel${dimmed}">${parts.join("")}</div>`;
   }
@@ -580,8 +600,11 @@ class ParmairCard extends HTMLElement {
     const heatRecovery = this._has("heat_recovery_efficiency")
       ? `${fmt0(this._raw("heat_recovery_efficiency"))}%`
       : "–";
+    const moreInfo = this._has("heat_recovery_efficiency")
+      ? ` data-more-info="heat_recovery_efficiency"`
+      : "";
     return `<div class="metrics">
-      <div class="metric-row"><span class="metric-label">Heat recovery</span><span class="metric-value">${heatRecovery}</span></div>
+      <div class="metric-row"><span class="metric-label"${moreInfo}>Heat recovery</span><span class="metric-value">${heatRecovery}</span></div>
     </div>`;
   }
 
@@ -608,19 +631,22 @@ class ParmairCard extends HTMLElement {
         ? `<button type="button" class="pwr-pill confirm" data-action="power">Turn off?</button>`
         : `<button type="button" class="pwr-pill" data-action="power">Turn off</button>`;
     }
-    return `<div class="set-row"><span class="set-label">Power</span>${pill}</div>`;
+    // Full-width row so the setting rows below pair up two-per-line.
+    return `<div class="set-row full"><span class="set-label" data-more-info="fan">Power</span>${pill}</div>`;
   }
 
   // A labeled −/value/+ row driving either a number entity
   // (number.set_value) or a climate setpoint (climate.set_temperature) —
-  // which one is decided by `action` and resolved in `_onClick`.
+  // which one is decided by `action` and resolved in `_onClick`. The label
+  // (and only the label — the buttons carry data-action, which wins) opens
+  // the entity's more-info dialog.
   _stepRowHtml(label, key, action, current, min, max, step, formatFn) {
     if (!this._has(key)) return "";
     const minusDisabled = current == null || current <= min;
     const plusDisabled = current == null || current >= max;
     const display = current == null ? "–" : formatFn(current);
     return `<div class="set-row">
-      <span class="set-label">${esc(label)}</span>
+      <span class="set-label" data-more-info="${key}">${esc(label)}</span>
       <div class="stepper mini">
         <button type="button" class="step-btn sm" data-action="${action}" data-key="${key}" data-dir="-1" data-min="${min}" data-max="${max}" data-step="${step}" aria-label="Decrease ${esc(label)}"${minusDisabled ? " disabled" : ""}>−</button>
         <span class="set-value">${display}</span>
@@ -633,13 +659,14 @@ class ParmairCard extends HTMLElement {
     if (!this._has(key)) return "";
     const on = this._isOn(key);
     return `<div class="set-row">
-      <span class="set-label">${esc(label)}</span>
+      <span class="set-label" data-more-info="${key}">${esc(label)}</span>
       <button type="button" class="toggle-pill${on ? " active" : ""}" data-action="toggle" data-switch="${key}">${on ? "On" : "Off"}</button>
     </div>`;
   }
 
   _expandedHtml() {
     if (!this._expanded) return "";
+    const pct = (v) => `${fmt0(v)}%`;
     const rows = [
       this._powerRowHtml(),
       this._stepRowHtml("Speed when home", "home_speed", "num-step", this._num("home_speed"), 1, 5, 1, fmt0),
@@ -648,6 +675,8 @@ class ParmairCard extends HTMLElement {
         this._climateTarget("supply_temperature_target"), 15, 25, 0.5, fmtTemp),
       this._stepRowHtml("Extract target (summer)", "extract_temperature_target", "climate-step",
         this._climateTarget("extract_temperature_target"), 18, 26, 0.5, fmtTemp),
+      this._stepRowHtml("Defrost min efficiency", "defrost_min_efficiency", "num-step",
+        this._num("defrost_min_efficiency"), 0, 100, 1, pct),
       this._toggleRowHtml("HRU temp control", "hru_temperature_control"),
       this._toggleRowHtml("Summer mode", "summer_mode"),
       this._toggleRowHtml("Post-heating", "post_heating"),
@@ -735,7 +764,12 @@ class ParmairCard extends HTMLElement {
       const style = document.createElement("style");
       style.textContent = CARD_CSS;
       shadow.appendChild(style);
-      this._card = document.createElement("ha-card");
+      // A plain <div>, deliberately NOT <ha-card>: ha-card carries themed
+      // host chrome (border, background, shadow via --ha-card-* vars) that
+      // kept painting an outline around the "chromeless" card even with our
+      // own overrides. Nothing in HA requires the root to be an ha-card.
+      this._card = document.createElement("div");
+      this._card.className = "root";
       shadow.appendChild(this._card);
       this._card.addEventListener("click", (e) => this._onClick(e));
       // Responsive stacking via ResizeObserver instead of a container query:
@@ -825,7 +859,17 @@ class ParmairCard extends HTMLElement {
 
   _onClick(e) {
     const el = e.target.closest("[data-action]");
-    if (!el) return;
+    if (!el) {
+      // No action target: fall back to more-info hotspots (header chips,
+      // setting-row labels, the Heat recovery label). Checked AFTER
+      // data-action so a row's control buttons always win over its label.
+      const moreEl = e.target.closest("[data-more-info]");
+      if (moreEl) {
+        const id = this._entityId(moreEl.dataset.moreInfo);
+        if (id) this._fireMoreInfo(id);
+      }
+      return;
+    }
     const action = el.dataset.action;
     const fanId = this._entityId("fan");
 
