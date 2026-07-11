@@ -144,17 +144,37 @@ type: custom:parmair-card
 device_id: <your parmair device>   # auto-detected when you have one unit
 title: Ventilation
 show_fan_row: true
-show_temperatures: true
-show_chips: true
+show_airflow: true
+show_metrics: true
 show_alerts: true
 compact: false
 ```
 
-The card shows power + status (defrost/summer/heating), a speed selector
-(Auto · 1–5), Boost/Fireplace/Summer chips with countdown badges,
-temperature flows (fresh→supply, extract→waste), efficiency/humidity/CO₂
-chips, and a filter/alarm banner with tap-to-acknowledge. It follows entity
-renames automatically (it resolves entities via the registry, not by id).
+**Split-panel layout**: a header (title, status badge, power) above two
+side-by-side panels — controls on the left, airflow on the right — that
+stack to a single column on narrow cards (≤440px).
+
+- **Header** — click the title for the fan's more-info dialog. The status
+  badge shows, in priority order, Defrosting → Summer (with a small "ᴬ"
+  marker when summer-auto is active) → Heating. The power button needs a
+  second tap to confirm turning the unit off (it becomes a red "Turn off?"
+  pill for 4 seconds); turning it back on is a single tap. While off, the
+  body panels dim and the speed/Boost/Fireplace controls are disabled.
+- **Controls panel** — an AUTO pill + −/+ stepper for fan speed (1–5), and
+  big Boost / Fireplace buttons with a countdown and a draining progress
+  bar (driven by each feature's `*_time_remaining` sensor against its
+  `*_duration` select).
+- **Airflow panel** (`show_airflow`) — an animated SVG cross-flow diagram
+  (Fresh/Extract in, Supply/Waste out, crossing through the heat-exchanger
+  core with its own temperature) plus a metrics list (`show_metrics`):
+  heat recovery %, fan power %, and humidity/CO₂ when those sensors exist.
+- **Alert banner** — amber "Filter change due" / red "Active alarm — tap to
+  acknowledge", hidden when clear.
+- **`compact: true`** shows only the header and controls panel.
+
+It follows entity renames automatically (it resolves entities via the
+registry, not by id). Older configs using `show_temperatures`/`show_chips`
+still work as aliases for `show_airflow`/`show_metrics`.
 
 ## Migrating from the built-in `modbus:` integration
 
