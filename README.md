@@ -150,11 +150,11 @@ show_alerts: true
 compact: false
 ```
 
-**Chromeless split-panel layout**: the card draws no background, border,
-or shadow of its own — all surfaces are translucent theme-derived fills,
-so it blends into themed/blurred dashboards. A header sits above two
-side-by-side panels — controls on the left, airflow on the right — that
-stack to a single column on narrow cards (≤440px).
+**Split-panel layout**: the outer card is chromeless (no background,
+border, or shadow of its own), with a bare header above sub-cards that
+render with your theme's regular card look — controls on the left,
+airflow on the right — stacking to a single column on narrow cards
+(≤440px).
 
 - **Header** — title (click for the fan's more-info dialog), then compact
   live chips for fan power, humidity, and CO₂ (each only when its sensor
@@ -174,8 +174,10 @@ stack to a single column on narrow cards (≤440px).
   through the heat-exchanger core). Endpoint and core temperatures sit on
   frosted-glass overlay labels, and each channel's blue↔amber gradient
   follows the *measured* temperatures — the colder end is blue, the warmer
-  end amber, flipping automatically between winter and summer.
-  `show_metrics` adds the labeled "Heat recovery" row below the diagram.
+  end amber, flipping automatically between winter and summer. The dash
+  animation speed tracks the current fan speed (faster at higher speeds,
+  frozen when the unit is off). `show_metrics` adds the labeled "Heat
+  recovery" row below the diagram.
 - **Settings section** (the "…" button) — expands below the panels: a
   full-width Power row (turning off needs a second tap on a red
   "Turn off?" pill within 4 s; turning on is a single tap and stays

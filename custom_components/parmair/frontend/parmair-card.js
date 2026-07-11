@@ -86,15 +86,16 @@ function registerCard(card) {
 }
 
 /*
- * Chromeless theming: the outer ha-card is fully transparent (no background,
- * border, or shadow) so the card blends with themed/blurred dashboard
- * backgrounds. Every surface inside uses translucent theme-derived fills
- * (color-mix over --primary-text-color / accent colors), never solid opaque
- * colors.
+ * Theming: the outer root is a chromeless plain div (no background, border,
+ * or shadow) so the header blends with themed/blurred dashboard backgrounds,
+ * while the inner panels (controls, airflow, settings) are real <ha-card>
+ * elements that pick up the theme's exact card chrome. Controls inside use
+ * translucent theme-derived fills (color-mix over --primary-text-color /
+ * accent colors), never solid opaque colors.
  *
  * This stylesheet is injected into the shadow root exactly ONCE (see
  * `_render`); everything that changes per render — gradient stops, drain-bar
- * widths — is inline in the markup instead.
+ * widths, the flow-animation duration — is inline in the markup instead.
  */
 const CARD_CSS = `
   :host { display: block; }
@@ -132,8 +133,12 @@ const CARD_CSS = `
   .body-grid.single { grid-template-columns: 1fr; }
   .narrow .body-grid { grid-template-columns: 1fr; }
 
-  .panel { background: color-mix(in srgb, var(--primary-text-color) 6%, transparent);
-    border-radius: 12px; padding: 8px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  /* The panels are real <ha-card> elements so they render with the theme's
+     exact card chrome — --ha-card-* background/border/radius/blur inherit
+     through the shadow boundary as CSS vars. No fills of our own here, only
+     internal layout. */
+  ha-card.panel { padding: 8px; display: flex; flex-direction: column; gap: 8px; min-width: 0;
+    box-sizing: border-box; }
   .panel.dimmed { opacity: 0.45; }
   .airflow-panel.dimmed { pointer-events: none; }
 
@@ -171,9 +176,14 @@ const CARD_CSS = `
 
   .airflow-wrap { position: relative; }
   .airflow-svg { width: 100%; height: auto; display: block; overflow: visible; }
-  .flow-base { fill: none; stroke-width: 9; stroke-linecap: round; opacity: 0.22; }
-  .flow-dash { fill: none; stroke-width: 3.5; stroke-linecap: round; stroke-dasharray: 4 8;
-    animation: parmair-flow 1.6s linear infinite; }
+  .flow-base { fill: none; stroke-width: 14; stroke-linecap: round; opacity: 0.22; }
+  /* Dash travel speed follows the fan: each render sets --flow-duration
+     inline on .airflow-wrap (4s / speed, so speed 1 ≈ 4s … speed 5 = 0.8s);
+     .flow-paused (fan off / speed 0) freezes the dashes in place. */
+  .flow-dash { fill: none; stroke-width: 5; stroke-linecap: round; stroke-dasharray: 4 8;
+    animation: parmair-flow 1.6s linear infinite;
+    animation-duration: var(--flow-duration, 1.6s); }
+  .flow-paused .flow-dash { animation-play-state: paused; }
   @keyframes parmair-flow { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -24; } }
   @media (prefers-reduced-motion: reduce) { .flow-dash { animation: none; } }
 
@@ -197,9 +207,8 @@ const CARD_CSS = `
   .metric-label { color: var(--secondary-text-color); }
   .metric-value { color: var(--primary-text-color); font-weight: 600; }
 
-  .more-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; margin-top: 10px;
-    padding: 8px 10px; border-radius: 12px;
-    background: color-mix(in srgb, var(--primary-text-color) 6%, transparent); }
+  ha-card.more-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px;
+    margin-top: 10px; padding: 8px 10px; box-sizing: border-box; }
   .narrow .more-grid { grid-template-columns: 1fr; }
   .set-row { display: flex; align-items: center; gap: 8px; min-height: 34px; }
   .set-row.full { grid-column: 1 / -1; }
@@ -522,7 +531,7 @@ class ParmairCard extends HTMLElement {
     parts.push(this._actionButtonHtml("boost", "mdi:fan-plus", "Boost mode", "boost_time_remaining", "boost_duration", 180, "accent-boost"));
     parts.push(this._actionButtonHtml("fireplace", "mdi:fireplace", "Fireplace mode", "fireplace_time_remaining", "fireplace_duration", 15, "accent-fireplace"));
     const dimmed = !this._isOn("fan") ? " dimmed" : "";
-    return `<div class="panel controls-panel${dimmed}">${parts.join("")}</div>`;
+    return `<ha-card class="panel controls-panel${dimmed}">${parts.join("")}</ha-card>`;
   }
 
   // ---- rendering: airflow panel ---------------------------------------------
@@ -566,10 +575,16 @@ class ParmairCard extends HTMLElement {
     const [ewStart, ewEnd] = this._flowColors(extractRaw, wasteRaw, [WARM, COOL]);
     const freshSupplyPath = `M${AIRFLOW_FRESH.x},${AIRFLOW_FRESH.y} L${AIRFLOW_SUPPLY.x},${AIRFLOW_SUPPLY.y}`;
     const extractWastePath = `M${AIRFLOW_EXTRACT.x},${AIRFLOW_EXTRACT.y} L${AIRFLOW_WASTE.x},${AIRFLOW_WASTE.y}`;
+    // Dash animation speed follows the fan: 4s / speed (speed 1 ≈ 4s,
+    // speed 5 = 0.8s), paused entirely at speed 0 or when the fan is off.
+    const speed = this._speedNumber();
+    const running = this._isOn("fan") && speed != null && speed > 0;
+    const duration = running ? (4 / speed).toFixed(2) : "1.6";
+    const pausedCls = running ? "" : " flow-paused";
     // The temperature labels are HTML overlays (not SVG <text>) so they can
     // carry a backdrop-filter blur — SVG text can't — keeping them readable
     // where they sit on top of the wide flow channels.
-    return `<div class="airflow-wrap">
+    return `<div class="airflow-wrap${pausedCls}" style="--flow-duration:${duration}s">
       <svg class="airflow-svg" viewBox="0 0 280 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
         <defs>
           <linearGradient id="pg-fs" gradientUnits="userSpaceOnUse" x1="${AIRFLOW_FRESH.x}" y1="${AIRFLOW_FRESH.y}" x2="${AIRFLOW_SUPPLY.x}" y2="${AIRFLOW_SUPPLY.y}">
@@ -612,7 +627,7 @@ class ParmairCard extends HTMLElement {
     const dimmed = !this._isOn("fan") ? " dimmed" : "";
     const parts = [this._airflowHtml()];
     if (this._config.show_metrics) parts.push(this._metricsHtml());
-    return `<div class="panel airflow-panel${dimmed}">${parts.join("")}</div>`;
+    return `<ha-card class="panel airflow-panel${dimmed}">${parts.join("")}</ha-card>`;
   }
 
   // ---- rendering: expandable settings section -------------------------------
@@ -685,7 +700,7 @@ class ParmairCard extends HTMLElement {
     // Deliberately NOT dimmed/disabled when the fan is off — the Power row
     // living here must stay usable, and the rest are settings registers that
     // are safe to adjust while the unit is stopped.
-    return `<div class="more-grid">${rows}</div>`;
+    return `<ha-card class="more-grid">${rows}</ha-card>`;
   }
 
   // ---- rendering: alerts + assembly -----------------------------------------
