@@ -6,7 +6,7 @@
  * discovers everything it needs from the *device*: point it at a Parmair
  * device (or let it auto-pick the first one) and it walks the entity
  * registry for entities that belong to that device, keying each one by the
- * suffix of its `unique_id` after the 32-hex-char config-entry prefix
+ * suffix of its `unique_id` after the config-entry-id prefix (hex or ULID)
  * (`<entry_id>_<key>`, e.g. `abc...def_fresh_air_temperature` ->
  * `fresh_air_temperature`). That key is exactly the translation_key/register
  * key the integration uses (see custom_components/parmair/entity.py), so it
@@ -56,10 +56,10 @@ function fmt0(v) {
   return Number.isNaN(n) ? "–" : String(Math.round(n));
 }
 
-// unique_ids are `${config_entry_id}_${key}` where the entry id is a 32-char
-// hex string — strip that prefix to recover the stable per-entity key.
+// unique_ids are `${config_entry_id}_${key}` where the entry id is a 32-hex
+// string or a 26-char ULID — strip that prefix to recover the per-entity key.
 function keyFromUniqueId(uniqueId) {
-  return String(uniqueId || "").replace(/^[0-9a-f]{32}_/, "");
+  return String(uniqueId || "").replace(/^[0-9A-Za-z]{26,32}_/, "");
 }
 
 function define(name, cls) {

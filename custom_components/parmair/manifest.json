@@ -1,14 +1,22 @@
 {
   "domain": "parmair",
   "name": "Parmair MAC",
-  "after_dependencies": ["lovelace"],
-  "codeowners": ["@machadolucas"],
+  "after_dependencies": [
+    "lovelace"
+  ],
+  "codeowners": [
+    "@machadolucas"
+  ],
   "config_flow": true,
-  "dependencies": ["http"],
+  "dependencies": [
+    "http"
+  ],
   "documentation": "https://github.com/machadolucas/ha-parmair",
   "integration_type": "device",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/machadolucas/ha-parmair/issues",
-  "requirements": ["pymodbus>=3.11.0"],
-  "version": "0.1.0"
+  "requirements": [
+    "pymodbus>=3.11.0"
+  ],
+  "version": "0.1.1"
 }
