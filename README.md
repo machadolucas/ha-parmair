@@ -150,27 +150,40 @@ show_alerts: true
 compact: false
 ```
 
-**Split-panel layout**: a header (title, status badge, power) above two
+**Chromeless split-panel layout**: the card draws no background, border,
+or shadow of its own — all surfaces are translucent theme-derived fills,
+so it blends into themed/blurred dashboards. A header sits above two
 side-by-side panels — controls on the left, airflow on the right — that
 stack to a single column on narrow cards (≤440px).
 
-- **Header** — click the title for the fan's more-info dialog. The status
-  badge shows, in priority order, Defrosting → Summer (with a small "ᴬ"
-  marker when summer-auto is active) → Heating. The power button needs a
-  second tap to confirm turning the unit off (it becomes a red "Turn off?"
-  pill for 4 seconds); turning it back on is a single tap. While off, the
-  body panels dim and the speed/Boost/Fireplace controls are disabled.
+- **Header** — title (click for the fan's more-info dialog), then compact
+  live chips for fan power, humidity, and CO₂ (each only when its sensor
+  exists), the status badge (Defrosting → Summer, with a small "ᴬ" marker
+  when summer-auto is active → Heating), and a round "…" button that
+  expands the settings section. While the unit is off, the body panels dim
+  and the speed/Boost/Fireplace controls are disabled.
 - **Controls panel** — an AUTO pill + −/+ stepper for fan speed (1–5), and
-  big Boost / Fireplace buttons with a countdown and a draining progress
-  bar (driven by each feature's `*_time_remaining` sensor against its
+  Boost / Fireplace buttons with a countdown and a draining progress bar
+  (driven by each feature's `*_time_remaining` sensor against its
   `*_duration` select).
 - **Airflow panel** (`show_airflow`) — an animated SVG cross-flow diagram
-  (Fresh/Extract in, Supply/Waste out, crossing through the heat-exchanger
-  core with its own temperature) plus a metrics list (`show_metrics`):
-  heat recovery %, fan power %, and humidity/CO₂ when those sensors exist.
+  with wide gradient flow channels (Fresh→Supply and Extract→Waste crossing
+  through the heat-exchanger core). Endpoint and core temperatures sit on
+  frosted-glass overlay labels, and each channel's blue↔amber gradient
+  follows the *measured* temperatures — the colder end is blue, the warmer
+  end amber, flipping automatically between winter and summer.
+  `show_metrics` adds the labeled "Heat recovery" row below the diagram.
+- **Settings section** (the "…" button) — expands below the panels into a
+  two-column grid: Power (turning off needs a second tap on a red
+  "Turn off?" pill within 4 s; turning on is a single tap and stays
+  available while everything else is dimmed), Speed when home / away
+  (1–5), Supply target (15–25 °C) and Extract target (18–26 °C) in 0.5°
+  steps, plus On/Off toggles for HRU temp control, Summer mode, and
+  Post-heating. Rows appear only when their entity exists.
 - **Alert banner** — amber "Filter change due" / red "Active alarm — tap to
   acknowledge", hidden when clear.
-- **`compact: true`** shows only the header and controls panel.
+- **`compact: true`** shows only the header and controls panel (the
+  settings section stays reachable via the "…" button).
 
 It follows entity renames automatically (it resolves entities via the
 registry, not by id). Older configs using `show_temperatures`/`show_chips`
