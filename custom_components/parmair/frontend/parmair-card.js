@@ -145,16 +145,18 @@ const CARD_CSS = `
   .speed-row { display: flex; align-items: center; gap: 6px; }
   .speed-label { flex: 0 0 auto; font-size: 0.78em; font-weight: 600; color: var(--secondary-text-color); }
   .auto-pill { flex: 0 0 auto; border: 1px solid var(--divider-color, rgba(127,127,127,0.35));
-    background: transparent; color: var(--secondary-text-color); font-size: 0.74em; font-weight: 700;
-    padding: 4px 10px; border-radius: 10px; cursor: pointer; }
+    background: transparent; color: var(--secondary-text-color); font-weight: 700;
+    padding: 3px 7px; border-radius: 10px; cursor: pointer; display: inline-flex;
+    align-items: center; }
+  .auto-pill ha-icon { --mdc-icon-size: 18px; }
   .auto-pill.active { background: color-mix(in srgb, var(--primary-color) 22%, transparent);
     color: var(--primary-color); border-color: transparent; }
-  .stepper { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+  .stepper { display: flex; align-items: center; gap: 2px; margin-left: auto; }
   .step-btn { width: 28px; height: 28px; border-radius: 50%; border: none; cursor: pointer; padding: 0;
     background: color-mix(in srgb, var(--primary-text-color) 9%, transparent);
     color: var(--primary-text-color); font-size: 1.05em; font-weight: 700; line-height: 1;
     display: inline-flex; align-items: center; justify-content: center; }
-  .speed-value { min-width: 20px; text-align: center; font-size: 1.3em; font-weight: 700;
+  .speed-value { min-width: 18px; text-align: center; font-size: 1.25em; font-weight: 700;
     color: var(--primary-text-color); }
   .speed-value.dimmed { opacity: 0.5; }
 
@@ -188,7 +190,7 @@ const CARD_CSS = `
   @media (prefers-reduced-motion: reduce) { .flow-dash { animation: none; } }
 
   .ep { position: absolute; display: inline-flex; align-items: baseline; gap: 4px;
-    padding: 3px 8px; border-radius: 10px; white-space: nowrap;
+    padding: 1px 6px; border-radius: 8px; white-space: nowrap; line-height: 1.2;
     background: color-mix(in srgb, var(--card-background-color, #808080) 45%, transparent);
     backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
   .ep-l { font-size: 12px; color: var(--secondary-text-color); }
@@ -207,10 +209,11 @@ const CARD_CSS = `
   .metric-label { color: var(--secondary-text-color); }
   .metric-value { color: var(--primary-text-color); font-weight: 600; }
 
-  ha-card.more-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px;
+  ha-card.more-grid { display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 4px 14px;
     margin-top: 10px; padding: 8px 10px; box-sizing: border-box; }
   .narrow .more-grid { grid-template-columns: 1fr; }
-  .set-row { display: flex; align-items: center; gap: 8px; min-height: 34px; }
+  .set-row { display: flex; align-items: center; gap: 8px; min-height: 34px; min-width: 0; }
   .set-row.full { grid-column: 1 / -1; }
   .set-label { flex: 1 1 auto; font-size: 0.82em; color: var(--secondary-text-color); min-width: 0;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -484,7 +487,7 @@ class ParmairCard extends HTMLElement {
     const display = n == null ? "–" : String(n);
     return `<div class="speed-row">
       <span class="speed-label">Speed</span>
-      <button type="button" class="auto-pill${autoActive ? " active" : ""}" data-action="preset-auto"${disabledAll ? " disabled" : ""}>AUTO</button>
+      <button type="button" class="auto-pill${autoActive ? " active" : ""}" data-action="preset-auto" title="Auto (preset control)" aria-label="Auto"${disabledAll ? " disabled" : ""}><ha-icon icon="mdi:fan-auto"></ha-icon></button>
       <div class="stepper">
         <button type="button" class="step-btn" data-action="speed-step" data-dir="-1" aria-label="Decrease speed"${minusDisabled ? " disabled" : ""}>−</button>
         <span class="speed-value${!isManual ? " dimmed" : ""}">${display}</span>
