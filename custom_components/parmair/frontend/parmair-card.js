@@ -129,7 +129,7 @@ const CARD_CSS = `
     color: var(--primary-color); }
   @media (prefers-reduced-motion: reduce) { .more-btn ha-icon { transition: none; } }
 
-  .body-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .body-grid { display: grid; grid-template-columns: minmax(150px, 4fr) 5fr; gap: 8px; }
   .body-grid.single { grid-template-columns: 1fr; }
   .narrow .body-grid { grid-template-columns: 1fr; }
 
@@ -142,19 +142,19 @@ const CARD_CSS = `
   .panel.dimmed { opacity: 0.45; }
   .airflow-panel.dimmed { pointer-events: none; }
 
-  .speed-row { display: flex; align-items: center; gap: 8px; }
+  .speed-row { display: flex; align-items: center; gap: 6px; }
   .speed-label { flex: 0 0 auto; font-size: 0.78em; font-weight: 600; color: var(--secondary-text-color); }
   .auto-pill { flex: 0 0 auto; border: 1px solid var(--divider-color, rgba(127,127,127,0.35));
     background: transparent; color: var(--secondary-text-color); font-size: 0.74em; font-weight: 700;
     padding: 4px 10px; border-radius: 10px; cursor: pointer; }
   .auto-pill.active { background: color-mix(in srgb, var(--primary-color) 22%, transparent);
     color: var(--primary-color); border-color: transparent; }
-  .stepper { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .stepper { display: flex; align-items: center; gap: 4px; margin-left: auto; }
   .step-btn { width: 28px; height: 28px; border-radius: 50%; border: none; cursor: pointer; padding: 0;
     background: color-mix(in srgb, var(--primary-text-color) 9%, transparent);
     color: var(--primary-text-color); font-size: 1.05em; font-weight: 700; line-height: 1;
     display: inline-flex; align-items: center; justify-content: center; }
-  .speed-value { min-width: 22px; text-align: center; font-size: 1.4em; font-weight: 700;
+  .speed-value { min-width: 20px; text-align: center; font-size: 1.3em; font-weight: 700;
     color: var(--primary-text-color); }
   .speed-value.dimmed { opacity: 0.5; }
 
@@ -792,7 +792,7 @@ class ParmairCard extends HTMLElement {
       // layout feedback loop (observed as minutes-long blank paints).
       this._resizeObserver = new ResizeObserver((entries) => {
         const width = entries[0]?.contentRect?.width || 0;
-        this._card.classList.toggle("narrow", width > 0 && width < 440);
+        this._card.classList.toggle("narrow", width > 0 && width < 360);
       });
       this._resizeObserver.observe(this._card);
     }
