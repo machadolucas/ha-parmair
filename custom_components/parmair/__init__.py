@@ -156,6 +156,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ParmairConfigEntry) -> b
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
 
+    # After the first refresh (so self.data backs the boost guard) and before
+    # platforms are forwarded (so the cooking entities find a live detector).
+    await coordinator.async_setup_cooking()
+
     await _async_register_frontend(hass)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

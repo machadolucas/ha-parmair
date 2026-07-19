@@ -97,6 +97,9 @@ before creating the entry.
   `Carbon dioxide` sensor and set the difference here (can be negative).
 - **Summer auto temperature source** — the temperature entity that drives
   the summer-mode automation. Empty = the unit's own fresh-air sensor.
+- **Air-quality sensors for cooking detection** — external kitchen sensors
+  (VOC index, humidity, PM…) that feed the cooking detector (see below).
+  Empty = feature disabled.
 - **Re-detect device features** — re-probe the unit after hardware changes
   (e.g. a CO₂ sensor was installed).
 
@@ -112,6 +115,36 @@ This integration adds an optional dwell-based automation on top:
 
 Manual toggles of the **Summer mode** switch are never blocked; the
 automation re-asserts its decision only after the opposite dwell completes.
+
+### Cooking detection
+
+Point the integration at fast-updating kitchen air-quality sensors (an
+ESPHome SEN55 works great) and it detects cooking within a few seconds of
+the first fumes — no thresholds to tune per season:
+
+1. Add the sensors in the integration options (e.g. a VOC index, a humidity
+   sensor and **one** particulate sensor — PM1/2.5/4/10 move together, so
+   adding several would double-count the same evidence).
+2. The integration learns a per-sensor baseline and noise level online
+   (persisted across restarts) and scores each sample as a deviation from
+   baseline, fusing all sensors: one strong spike triggers alone, two
+   moderate ones together. The baseline is frozen while cooking is detected
+   so long cooks can't blend into it, and re-learned automatically after
+   sensor reboots or outages.
+3. `binary_sensor.*_cooking_detected` turns on/off with the detection (its
+   attributes show per-sensor baselines and z-scores; the diagnostic
+   `Cooking score` sensor is graphable for tuning).
+4. Optional: turn on the **Cooking boost automation** switch and the
+   integration itself raises the unit's Boost preset while cooking and
+   restores Home/Away afterwards. It never steals a boost it didn't start:
+   manual/CO₂ boosts are left alone, and a manual boost-off is respected.
+5. Tune with three numbers: *sensitivity* (1–10), *off delay* and *minimum
+   boost time*. With a single configured sensor, sensitivities 1–2 are
+   effectively "never" — fusion needs more than one sensor to reach the bar.
+
+If you'd rather keep boost decisions in your own automations (presence or
+time-of-day gating, arbitration with other boost causes), leave the switch
+off and trigger on the binary sensor instead.
 
 ## Entities
 

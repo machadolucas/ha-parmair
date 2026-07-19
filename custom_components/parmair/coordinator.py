@@ -30,18 +30,36 @@ from functools import partial
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import (
+    EventStateChangedData,
+    async_call_later,
+    async_track_state_change_event,
+    async_track_time_interval,
+)
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .capabilities import Capabilities
 from .const import (
+    CONF_COOKING_SENSORS,
     CONF_SCAN_INTERVAL,
     CONF_SUMMER_AUTO_SOURCE,
     CONNECTION_LOST_THRESHOLD,
+    CONTROL_STATE_AWAY,
+    CONTROL_STATE_BOOST,
+    CONTROL_STATE_HOME,
+    COOKING_HEARTBEAT_S,
+    COOKING_SAVE_INTERVAL_S,
+    COOKING_STORAGE_KEY,
+    COOKING_STORAGE_VERSION,
+    DEFAULT_COOKING_MIN_BOOST_MIN,
+    DEFAULT_COOKING_OFF_DELAY_MIN,
+    DEFAULT_COOKING_SENSITIVITY,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SUMMER_AUTO_OFF_DWELL_MIN,
     DEFAULT_SUMMER_AUTO_OFF_TEMP_C,
@@ -52,7 +70,18 @@ from .const import (
     ISSUE_CONNECTION_LOST,
     ISSUE_FILTER_CHANGE_DUE,
     MANUFACTURER,
+    POWER_STATE_ON,
+    POWER_STATE_TURNING_ON,
+    SIGNAL_COOKING_UPDATE,
+    SPEED_CONTROL_AUTO,
     VERIFY_KEY,
+)
+from .cooking_detect import (
+    DEFAULT_SIGMA_FLOOR,
+    CookingDetector,
+    CookingParams,
+    CookingResult,
+    SensorSpec,
 )
 from .modbus import ParmairConnectionError, ParmairModbusClient
 from .registers import ReadBlock, RegisterMap, build_read_plan, decode, encode
@@ -65,6 +94,15 @@ ParmairData = dict[str, float | int | None]
 # Verify-read delay after a write: long enough for the controller to have
 # applied the change and for the reflected register(s) to settle.
 VERIFY_DELAY = 1.0
+
+# power_state values that count as "unit running" for the cooking auto-boost
+# guard — same interpretation the fan platform uses (2 = turning on, 3 = on).
+_POWER_ON_STATES = (POWER_STATE_TURNING_ON, POWER_STATE_ON)
+
+
+def restore_control_state(data: ParmairData) -> int:
+    """The control-state value that returns the unit to its prior home/away mode."""
+    return CONTROL_STATE_HOME if data.get("home_state") == 1 else CONTROL_STATE_AWAY
 
 
 class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
@@ -111,6 +149,28 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         )
         self._summer_auto_logic = SummerAutoLogic()
 
+        # Cooking detection. The switch/number entities drive the tunables; the
+        # detector itself is built only when source sensors are configured (see
+        # async_setup_cooking), so the feature stays inert otherwise. Cooking
+        # state lives on these attributes — never in ``self.data`` — and reaches
+        # its entities via the SIGNAL_COOKING_UPDATE dispatcher.
+        self.cooking_params: CookingParams = CookingParams(
+            sensitivity=DEFAULT_COOKING_SENSITIVITY,
+            off_delay_min=DEFAULT_COOKING_OFF_DELAY_MIN,
+        )
+        self.cooking_auto_boost_enabled: bool = False
+        self.cooking_min_boost_run_min: float = DEFAULT_COOKING_MIN_BOOST_MIN
+        self.cooking_detector: CookingDetector | None = None
+        self._cooking_boost_owner: bool = False
+        self._cooking_boost_started: datetime | None = None
+        self._cooking_restore_cancel: Callable[[], None] | None = None
+        self._cooking_heartbeat_cancel: Callable[[], None] | None = None
+        self._cooking_store: Store | None = None
+        self._cooking_last_sent_score: float = 0.0
+        # Source entities whose noise floor couldn't be classified at setup (no
+        # state yet); reclassified on their first event.
+        self._cooking_unclassified: set[str] = set()
+
     @property
     def read_plan(self) -> list[ReadBlock]:
         """The dynamic-register read plan built in :meth:`async_setup` (diagnostics)."""
@@ -130,6 +190,21 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
     def register_map_name(self) -> str:
         """The register map in use, e.g. ``"v1_87"`` (diagnostics)."""
         return self._map.name
+
+    @property
+    def cooking_active(self) -> bool:
+        """Whether the detector currently holds a cooking detection (False if off)."""
+        return self.cooking_detector is not None and self.cooking_detector.active
+
+    @property
+    def cooking_score(self) -> float:
+        """The detector's most recent fused score (0.0 when the detector is off)."""
+        return self.cooking_detector.score if self.cooking_detector is not None else 0.0
+
+    @property
+    def cooking_configured(self) -> bool:
+        """Whether the options list any cooking source sensors."""
+        return bool(self.config_entry.options.get(CONF_COOKING_SENSORS))
 
     async def async_setup(self) -> None:
         """Connect, snapshot the static registers, and plan the dynamic poll.
@@ -203,6 +278,7 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         self.last_successful_update = dt_util.utcnow()
         self._update_repairs(data)
         self._evaluate_summer_auto(data)
+        self._reconcile_cooking_boost(data)
         return data
 
     # ── Repairs ──────────────────────────────────────────────────────────
@@ -299,6 +375,231 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         except (TypeError, ValueError):
             return None
 
+    # ── Cooking detection ────────────────────────────────────────────────
+
+    async def async_setup_cooking(self) -> None:
+        """Build the detector and subscribe its listeners, if any sensors are set.
+
+        Called once from ``__init__.async_setup_entry`` after the first refresh
+        (so ``self.data`` is populated for the boost guard) and before platforms
+        are forwarded. A no-op when the option is empty — the detector stays
+        ``None`` and every cooking property/entity reads inert. Listener/timer
+        teardown rides the config-entry unload (options changes reload the entry).
+        """
+        entity_ids: list[str] = self.config_entry.options.get(CONF_COOKING_SENSORS) or []
+        if not entity_ids:
+            return
+
+        specs: dict[str, SensorSpec] = {}
+        for entity_id in entity_ids:
+            floor = self._cooking_sigma_floor(entity_id)
+            if floor is None:
+                # No state yet (e.g. ESPHome sensor still booting): seed the
+                # fallback floor and reclassify on the sensor's first event.
+                self._cooking_unclassified.add(entity_id)
+                floor = DEFAULT_SIGMA_FLOOR
+            specs[entity_id] = SensorSpec(sigma_floor=floor)
+        self.cooking_detector = CookingDetector(specs)
+
+        self._cooking_store = Store(
+            self.hass,
+            COOKING_STORAGE_VERSION,
+            COOKING_STORAGE_KEY.format(self.config_entry.entry_id),
+        )
+        stored = await self._cooking_store.async_load()
+        if stored:
+            self.cooking_detector.restore(stored, dt_util.utcnow())
+
+        self.config_entry.async_on_unload(
+            async_track_state_change_event(self.hass, entity_ids, self._async_cooking_event)
+        )
+        self.config_entry.async_on_unload(
+            async_track_time_interval(
+                self.hass,
+                self._async_cooking_save,
+                timedelta(seconds=COOKING_SAVE_INTERVAL_S),
+            )
+        )
+
+    def _cooking_sigma_floor(self, entity_id: str) -> float | None:
+        """Classify a source sensor's noise floor from its device_class/unit.
+
+        Returns ``None`` when the entity has no state yet, so the caller can
+        retry on the first event. Floors mirror the plan's per-signal noise
+        estimates; unitless Sensirion VOC/NOx indices fall through to the
+        detector's default.
+        """
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        device_class = state.attributes.get("device_class")
+        unit = state.attributes.get("unit_of_measurement")
+        if device_class == "humidity" or unit == "%":
+            return 1.0
+        if unit in ("µg/m³", "μg/m³"):  # both micro-sign code points seen in the wild
+            return 1.0
+        if device_class == "carbon_dioxide" or unit == "ppm":
+            return 25.0
+        return DEFAULT_SIGMA_FLOOR
+
+    @callback
+    def _async_cooking_event(self, event: Event[EventStateChangedData]) -> None:
+        """Feed one source-sensor state change into the detector.
+
+        Broad-except like :meth:`_evaluate_summer_auto`: a malformed state must
+        never tear down the state-change listener.
+        """
+        if self.cooking_detector is None:
+            return
+        try:
+            entity_id = event.data["entity_id"]
+            state = event.data.get("new_state")
+            if entity_id in self._cooking_unclassified:
+                floor = self._cooking_sigma_floor(entity_id)
+                if floor is not None:
+                    self.cooking_detector.set_sigma_floor(entity_id, floor)
+                    self._cooking_unclassified.discard(entity_id)
+            if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                value: float | None = None
+            else:
+                value = self._as_float(state.state)
+            result = self.cooking_detector.update(
+                dt_util.utcnow(), entity_id, value, self.cooking_params
+            )
+            self._handle_cooking_result(result)
+        except Exception:  # noqa: BLE001 - never let a bad state break the listener
+            _LOGGER.exception("Parmair cooking event handling failed")
+
+    @callback
+    def _async_cooking_heartbeat(self, _now: datetime) -> None:
+        """Tick the state machine while a detection is active (all-silent timeout)."""
+        if self.cooking_detector is None:
+            return
+        try:
+            result = self.cooking_detector.tick(dt_util.utcnow(), self.cooking_params)
+            self._handle_cooking_result(result)
+        except Exception:  # noqa: BLE001 - never let a tick break the heartbeat timer
+            _LOGGER.exception("Parmair cooking heartbeat failed")
+
+    @callback
+    def _handle_cooking_result(self, result: CookingResult) -> None:
+        """React to one detector outcome: heartbeat, auto-boost, and dispatch."""
+        if result.transition is True:
+            self._start_cooking_heartbeat()
+            if self._cooking_restore_cancel is not None:
+                # Re-triggered during the min-boost restore delay: the boost we
+                # own is still on, so just cancel the pending restore and keep it.
+                self._cooking_restore_cancel()
+                self._cooking_restore_cancel = None
+            elif self.cooking_auto_boost_enabled:
+                self.hass.async_create_task(self._async_cooking_boost_start())
+        elif result.transition is False:
+            self._stop_cooking_heartbeat()
+            if self._cooking_boost_owner:
+                self._schedule_cooking_restore()
+
+        # Dispatcher-only: cooking entities never ride async_set_updated_data
+        # (that would fake a register poll every ~2 s). Nudge on every edge and
+        # on a meaningful score move.
+        score_moved = abs(result.score - self._cooking_last_sent_score) >= 0.05
+        if result.transition is not None or score_moved:
+            self._cooking_last_sent_score = result.score
+            async_dispatcher_send(
+                self.hass, SIGNAL_COOKING_UPDATE.format(self.config_entry.entry_id)
+            )
+
+    def _start_cooking_heartbeat(self) -> None:
+        if self._cooking_heartbeat_cancel is not None:
+            return
+        self._cooking_heartbeat_cancel = async_track_time_interval(
+            self.hass, self._async_cooking_heartbeat, timedelta(seconds=COOKING_HEARTBEAT_S)
+        )
+
+    def _stop_cooking_heartbeat(self) -> None:
+        if self._cooking_heartbeat_cancel is not None:
+            self._cooking_heartbeat_cancel()
+            self._cooking_heartbeat_cancel = None
+
+    async def _async_cooking_boost_start(self) -> None:
+        """Claim the boost for a fresh detection — only if safe to own it.
+
+        Skips (no ownership) when the unit is off or boost is already active
+        (manual or CO₂-auto): turning that boost off later isn't ours to do.
+        Ownership is set only after the write succeeds, so a failed write leaves
+        no phantom claim.
+        """
+        data = self.data
+        if not data:
+            return
+        if data.get("boost_active") or data.get("power_state") not in _POWER_ON_STATES:
+            return
+        try:
+            await self.async_write_sequence(
+                [("speed_control", SPEED_CONTROL_AUTO), ("control_state", CONTROL_STATE_BOOST)]
+            )
+        except ParmairConnectionError as err:
+            _LOGGER.warning("Parmair cooking auto-boost start failed: %s", err)
+            return
+        self._cooking_boost_owner = True
+        self._cooking_boost_started = dt_util.utcnow()
+
+    def _schedule_cooking_restore(self) -> None:
+        """Restore the prior mode after the minimum boost run-time has elapsed."""
+        elapsed = (
+            (dt_util.utcnow() - self._cooking_boost_started).total_seconds()
+            if self._cooking_boost_started is not None
+            else 0.0
+        )
+        delay = max(0.0, self.cooking_min_boost_run_min * 60.0 - elapsed)
+        if self._cooking_restore_cancel is not None:
+            self._cooking_restore_cancel()
+        self._cooking_restore_cancel = async_call_later(
+            self.hass, delay, self._async_cooking_restore
+        )
+
+    async def _async_cooking_restore(self, _now: datetime) -> None:
+        """Return the unit to home/away after a cooking auto-boost.
+
+        Re-checks ownership and that the boost we started is still active: if the
+        user switched to fireplace/manual/off or the unit's timer already ended
+        the boost, we just drop ownership and write nothing.
+        """
+        self._cooking_restore_cancel = None
+        data = self.data
+        if not self._cooking_boost_owner or not data or not data.get("boost_active"):
+            self._cooking_boost_owner = False
+            self._cooking_boost_started = None
+            return
+        try:
+            await self.async_write("control_state", restore_control_state(data))
+        except ParmairConnectionError as err:
+            _LOGGER.warning("Parmair cooking auto-boost restore failed: %s", err)
+        self._cooking_boost_owner = False
+        self._cooking_boost_started = None
+
+    def _reconcile_cooking_boost(self, data: ParmairData) -> None:
+        """Drop boost ownership once the boost we started is gone.
+
+        Respects a manual boost-off or the unit's own boost timer expiring —
+        we stop trying to restore a boost that's no longer there. Tiny and
+        non-raising by construction (runs inside the poll cycle).
+        """
+        if self._cooking_boost_owner and not data.get("boost_active"):
+            self._cooking_boost_owner = False
+            self._cooking_boost_started = None
+            if self._cooking_restore_cancel is not None:
+                self._cooking_restore_cancel()
+                self._cooking_restore_cancel = None
+
+    async def _async_cooking_save(self, _now: datetime) -> None:
+        """Persist learned baselines on the periodic interval."""
+        if self.cooking_detector is None or self._cooking_store is None:
+            return
+        try:
+            await self._cooking_store.async_save(self.cooking_detector.snapshot(dt_util.utcnow()))
+        except Exception:  # noqa: BLE001 - a failed save must not break the timer
+            _LOGGER.warning("Parmair cooking baseline save failed", exc_info=True)
+
     # ── Writes ───────────────────────────────────────────────────────────
 
     async def async_write(self, key: str, value: float | int) -> None:
@@ -346,10 +647,21 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         self.async_set_updated_data(updated)
 
     async def async_shutdown(self) -> None:
-        """Cancel any pending verify timer, then defer to the base shutdown."""
+        """Cancel pending timers, flush cooking baselines, then base shutdown."""
         if self._verify_cancel is not None:
             self._verify_cancel()
             self._verify_cancel = None
+        self._stop_cooking_heartbeat()
+        if self._cooking_restore_cancel is not None:
+            self._cooking_restore_cancel()
+            self._cooking_restore_cancel = None
+        if self.cooking_detector is not None and self._cooking_store is not None:
+            try:
+                await self._cooking_store.async_save(
+                    self.cooking_detector.snapshot(dt_util.utcnow())
+                )
+            except Exception:  # noqa: BLE001 - best-effort flush on unload
+                _LOGGER.warning("Parmair cooking baseline final save failed", exc_info=True)
         await super().async_shutdown()
 
 

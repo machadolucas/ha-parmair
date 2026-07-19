@@ -14,6 +14,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.parmair.const import (
     CONF_CAPABILITIES,
     CONF_CO2_OFFSET,
+    CONF_COOKING_SENSORS,
     CONF_REDETECT,
     CONF_REGISTER_MAP,
     CONF_SCAN_INTERVAL,
@@ -255,3 +256,43 @@ async def test_options_flow_sets_and_clears_summer_auto_source(
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert CONF_SUMMER_AUTO_SOURCE not in entry.options
+
+
+async def test_options_flow_sets_and_clears_cooking_sensors(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    entry, fake_client = await async_setup_integration(rexo120_bank)
+
+    with patch("custom_components.parmair.modbus.create_client", return_value=fake_client):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {
+                CONF_SCAN_INTERVAL: 10,
+                CONF_CO2_OFFSET: 0,
+                CONF_COOKING_SENSORS: ["sensor.kitchen_voc_index", "sensor.kitchen_humidity"],
+                CONF_REDETECT: False,
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_COOKING_SENSORS] == [
+        "sensor.kitchen_voc_index",
+        "sensor.kitchen_humidity",
+    ]
+
+    with patch("custom_components.parmair.modbus.create_client", return_value=fake_client):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {
+                CONF_SCAN_INTERVAL: 10,
+                CONF_CO2_OFFSET: 0,
+                CONF_REDETECT: False,
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert CONF_COOKING_SENSORS not in entry.options

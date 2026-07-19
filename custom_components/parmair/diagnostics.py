@@ -14,6 +14,7 @@ from typing import Any
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .coordinator import ParmairConfigEntry
 
@@ -52,5 +53,20 @@ async def async_get_config_entry_diagnostics(
             "last_update_success": coordinator.last_update_success,
             "summer_auto_enabled": coordinator.summer_auto_enabled,
             "summer_auto_params": asdict(coordinator.summer_auto_params),
+        },
+        "cooking": {
+            "configured": coordinator.cooking_configured,
+            "auto_boost_enabled": coordinator.cooking_auto_boost_enabled,
+            "params": asdict(coordinator.cooking_params),
+            "min_boost_run_min": coordinator.cooking_min_boost_run_min,
+            "active": coordinator.cooking_active,
+            "score": coordinator.cooking_score,
+            # Source entity ids aren't sensitive (only the Modbus host is
+            # redacted above), so per-sensor diagnostics are included as-is.
+            "sensors": (
+                coordinator.cooking_detector.diagnostics(dt_util.utcnow())
+                if coordinator.cooking_detector is not None
+                else {}
+            ),
         },
     }

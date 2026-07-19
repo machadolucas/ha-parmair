@@ -20,6 +20,7 @@ PLATFORMS: list[Platform] = [
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_CO2_OFFSET = "co2_offset"
 CONF_SUMMER_AUTO_SOURCE = "summer_auto_source"
+CONF_COOKING_SENSORS = "cooking_sensors"
 CONF_REGISTER_MAP = "register_map"
 CONF_CAPABILITIES = "capabilities"
 CONF_REDETECT = "redetect"
@@ -36,6 +37,30 @@ DEFAULT_SUMMER_AUTO_ON_TEMP_C = 21.0
 DEFAULT_SUMMER_AUTO_ON_DWELL_MIN = 60.0
 DEFAULT_SUMMER_AUTO_OFF_TEMP_C = 15.0
 DEFAULT_SUMMER_AUTO_OFF_DWELL_MIN = 120.0
+
+# Cooking-detection defaults — the cooking switch/number entities override these
+# at runtime; the coordinator seeds the detector with them. sensitivity/off-delay
+# feed CookingParams; min-boost is boost glue (a coordinator attribute, not
+# detector math).
+DEFAULT_COOKING_SENSITIVITY = 5.0
+DEFAULT_COOKING_OFF_DELAY_MIN = 4.0
+DEFAULT_COOKING_MIN_BOOST_MIN = 10.0
+
+# Dispatcher signal (formatted with the entry_id) the cooking binary-sensor and
+# score sensor subscribe to: the event-driven cooking path never touches
+# ``coordinator.data``/``async_set_updated_data`` (that would fake a register
+# poll every ~2 s), so it nudges those entities over the dispatcher instead.
+SIGNAL_COOKING_UPDATE = "parmair_cooking_update_{}"
+
+# Learned-baseline persistence (homeassistant.helpers.storage.Store). Saved on a
+# fixed interval plus an unload flush rather than debounced per event — 2 s
+# events would defer a delay-save forever.
+COOKING_STORAGE_VERSION = 1
+COOKING_STORAGE_KEY = "parmair_cooking_{}"
+COOKING_SAVE_INTERVAL_S = 900
+# Heartbeat cadence while a detection is active, so an all-silent sensor set
+# still times the detection out (the detector only re-evaluates on a tick).
+COOKING_HEARTBEAT_S = 30
 
 MANUFACTURER = "Parmair"
 

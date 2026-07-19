@@ -33,6 +33,7 @@ from .capabilities import (
 from .const import (
     CONF_CAPABILITIES,
     CONF_CO2_OFFSET,
+    CONF_COOKING_SENSORS,
     CONF_REDETECT,
     CONF_REGISTER_MAP,
     CONF_SCAN_INTERVAL,
@@ -201,6 +202,11 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
             ): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
             ),
+            vol.Optional(
+                CONF_COOKING_SENSORS, description=suggest(CONF_COOKING_SENSORS)
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor", multiple=True)
+            ),
             vol.Required(CONF_REDETECT, default=False): selector.BooleanSelector(),
         }
     )
@@ -313,6 +319,9 @@ class ParmairOptionsFlow(OptionsFlow):
                 summer_auto_source = user_input.get(CONF_SUMMER_AUTO_SOURCE)
                 if summer_auto_source:
                     options[CONF_SUMMER_AUTO_SOURCE] = summer_auto_source
+                cooking_sensors = user_input.get(CONF_COOKING_SENSORS)
+                if cooking_sensors:
+                    options[CONF_COOKING_SENSORS] = cooking_sensors
                 return self.async_create_entry(data=options)
 
         return self.async_show_form(

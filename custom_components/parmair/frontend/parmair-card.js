@@ -117,6 +117,7 @@ const CARD_CSS = `
   .hchip.icon-only { padding: 3px 6px; }
   .hchip.chip-summer { background: color-mix(in srgb, #ff9800 20%, transparent); color: #ff9800; }
   .hchip.chip-cold { background: color-mix(in srgb, #2196f3 20%, transparent); color: #2196f3; }
+  .hchip.chip-cook { background: color-mix(in srgb, #ff6f00 20%, transparent); color: #ff6f00; }
   .hchip.chip-dim { opacity: 0.55; }
   .auto-dot { margin-left: 2px; font-size: 0.85em; opacity: 0.9; }
 
@@ -452,6 +453,9 @@ class ParmairCard extends HTMLElement {
     if (this._isOn("defrosting")) {
       chips.push(this._iconChipHtml("defrosting", "mdi:snowflake", "Defrosting", "chip-cold"));
     }
+    if (this._has("cooking_detected") && this._isOn("cooking_detected")) {
+      chips.push(this._iconChipHtml("cooking_detected", "mdi:pot-steam", "Cooking detected", "chip-cook"));
+    }
     if (this._has("home")) {
       const home = this._isOn("home");
       chips.push(
@@ -556,13 +560,6 @@ class ParmairCard extends HTMLElement {
     return a < b ? [COOL, WARM] : [WARM, COOL];
   }
 
-  // A small filled triangle pointing along `angleDeg`, placed near (but
-  // slightly before) the flow's exit point so it doesn't collide with the
-  // endpoint overlays.
-  _arrowheadHtml(x, y, angleDeg, color) {
-    return `<polygon class="arrowhead" points="0,-4 8,0 0,4" fill="${color}" transform="translate(${x},${y}) rotate(${angleDeg})"></polygon>`;
-  }
-
   _epOverlayHtml(posClass, label, value) {
     return `<div class="ep ${posClass}"><span class="ep-l">${esc(label)}</span><span class="ep-v">${value}</span></div>`;
   }
@@ -603,8 +600,6 @@ class ParmairCard extends HTMLElement {
         <path class="flow-dash" d="${freshSupplyPath}" stroke="url(#pg-fs)"></path>
         <path class="flow-base" d="${extractWastePath}" stroke="url(#pg-ew)"></path>
         <path class="flow-dash" d="${extractWastePath}" stroke="url(#pg-ew)"></path>
-        ${this._arrowheadHtml(220.5, 88, 19.1, fsEnd)}
-        ${this._arrowheadHtml(59.5, 88, 160.9, ewEnd)}
       </svg>
       ${this._epOverlayHtml("ep-tl", "Fresh", fmtTemp(freshRaw))}
       ${this._epOverlayHtml("ep-tr", "Extract", fmtTemp(extractRaw))}

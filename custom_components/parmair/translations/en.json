@@ -38,12 +38,14 @@
           "scan_interval": "Poll interval",
           "co2_offset": "CO₂ calibration offset",
           "summer_auto_source": "Summer-mode automation temperature source",
+          "cooking_sensors": "Air-quality sensors for cooking detection",
           "redetect": "Re-detect sensors and options"
         },
         "data_description": {
           "scan_interval": "How often to poll the unit for updated values.",
           "co2_offset": "Added to the unit's raw CO₂ reading to correct a miscalibrated sensor, in parts per million.",
           "summer_auto_source": "Temperature entity driving the automatic summer-mode switch. Leave empty to use the unit's own fresh-air sensor.",
+          "cooking_sensors": "Kitchen air-quality sensors (e.g. VOC index, humidity, PM) the integration learns baselines from to detect cooking spikes. Avoid adding several correlated particulate-matter sizes at once (PM1/2.5/4/10 move together) — one PM sensor is enough. Leave empty to disable cooking detection.",
           "redetect": "Reconnect and re-run sensor/option detection before saving, e.g. after physically fitting a new sensor. Leave off to just save the settings below."
         }
       }
@@ -240,6 +242,9 @@
       },
       "fault_return_water_sensor": {
         "name": "Return water sensor fault"
+      },
+      "cooking_score": {
+        "name": "Cooking score"
       }
     },
     "binary_sensor": {
@@ -272,6 +277,9 @@
       },
       "io_initialized": {
         "name": "I/O initialized"
+      },
+      "cooking_detected": {
+        "name": "Cooking detected"
       }
     },
     "switch": {
@@ -298,6 +306,9 @@
       },
       "alarm_sound": {
         "name": "Alarm sound"
+      },
+      "cooking_auto_boost": {
+        "name": "Cooking boost automation"
       }
     },
     "number": {
@@ -363,6 +374,15 @@
       },
       "summer_auto_off_minutes": {
         "name": "Summer auto: off dwell time"
+      },
+      "cooking_sensitivity": {
+        "name": "Cooking detection sensitivity"
+      },
+      "cooking_off_delay": {
+        "name": "Cooking off delay"
+      },
+      "cooking_min_boost_minutes": {
+        "name": "Cooking minimum boost time"
       }
     },
     "select": {

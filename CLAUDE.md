@@ -36,6 +36,7 @@ via HACS from `machadolucas/ha-parmair`.
 | `registers.py` | pure | v1.87 register map, `build_read_plan()` block coalescing, `encode`/`decode` |
 | `capabilities.py` | pure | parse config registers 240–245 + probe sentinels → `Capabilities`; gates entities & read plan |
 | `summer_auto.py` | pure | dwell state machine for the summer-mode automation |
+| `cooking_detect.py` | pure | online per-sensor baselines (EMA + EW abs-residual, one-sided z, slope-z) fused into a hysteretic cooking detection; baselines freeze while active |
 | `modbus.py` | pymodbus only | `ParmairModbusClient` (persistent async client, lock, pacing, retries); `create_client()` factory is what tests patch |
 | `coordinator.py` | HA | `ParmairCoordinator`: block reads, static-once reads, partial-failure tolerance, write + optimistic update + delayed verify-read, repairs, summer-auto evaluation |
 | `config_flow.py` | HA | user → probe → confirm; options (scan interval, CO₂ offset, summer-auto source, re-detect) |
@@ -57,6 +58,14 @@ Rules:
   created/polled only when `Capabilities.supports()` says so. When adding a
   register, decide its gate; probe-based gates read the sentinel at config
   time.
+- Cooking detection is **event-driven**, not polled: the coordinator feeds
+  external sensor state-change events into one long-lived `CookingDetector`
+  and notifies its entities via the `SIGNAL_COOKING_UPDATE` dispatcher —
+  never `async_set_updated_data` (cooking state lives on coordinator
+  attributes, `coordinator.data` stays register-values only). Learned
+  baselines persist in `Store` (`.storage/parmair_cooking_<entry_id>`).
+  Auto-boost claims ownership only for boosts it started (write succeeds →
+  claim; poll shows boost gone → drop) so manual/CO₂ boosts are respected.
 
 ## Write semantics (verified on the real unit)
 

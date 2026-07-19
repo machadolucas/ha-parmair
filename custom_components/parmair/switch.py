@@ -22,12 +22,15 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
-    CONTROL_STATE_AWAY,
     CONTROL_STATE_BOOST,
     CONTROL_STATE_FIREPLACE,
-    CONTROL_STATE_HOME,
 )
-from .coordinator import ParmairConfigEntry, ParmairCoordinator, ParmairData
+from .coordinator import (
+    ParmairConfigEntry,
+    ParmairCoordinator,
+    ParmairData,
+    restore_control_state,
+)
 from .entity import ParmairEntity
 from .registers import REGISTER_MAPS
 
@@ -58,11 +61,6 @@ def _direct_turn_off(
     return _fn
 
 
-def _restore_control_state(data: ParmairData) -> int:
-    """The control-state value that returns the unit to its prior home/away mode."""
-    return CONTROL_STATE_HOME if data.get("home_state") == 1 else CONTROL_STATE_AWAY
-
-
 def _boost_is_on(data: ParmairData) -> bool | None:
     value = data.get("boost_active")
     return None if value is None else bool(value)
@@ -73,7 +71,7 @@ async def _boost_turn_on(coordinator: ParmairCoordinator, data: ParmairData) -> 
 
 
 async def _boost_turn_off(coordinator: ParmairCoordinator, data: ParmairData) -> None:
-    await coordinator.async_write("control_state", _restore_control_state(data))
+    await coordinator.async_write("control_state", restore_control_state(data))
 
 
 def _fireplace_is_on(data: ParmairData) -> bool | None:
@@ -86,7 +84,7 @@ async def _fireplace_turn_on(coordinator: ParmairCoordinator, data: ParmairData)
 
 
 async def _fireplace_turn_off(coordinator: ParmairCoordinator, data: ParmairData) -> None:
-    await coordinator.async_write("control_state", _restore_control_state(data))
+    await coordinator.async_write("control_state", restore_control_state(data))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -175,6 +173,8 @@ async def async_setup_entry(
         if description.register_key is None or description.register_key in included
     ]
     entities.append(ParmairSummerAutoSwitch(coordinator))
+    if coordinator.cooking_configured:
+        entities.append(ParmairCookingAutoBoostSwitch(coordinator))
     async_add_entities(entities)
 
 
@@ -242,3 +242,37 @@ class ParmairSummerAutoSwitch(ParmairEntity, RestoreEntity, SwitchEntity):
         last_state = await self.async_get_last_state()
         if last_state is not None:
             self.coordinator.summer_auto_enabled = last_state.state == "on"
+
+
+class ParmairCookingAutoBoostSwitch(ParmairEntity, RestoreEntity, SwitchEntity):
+    """Local enable flag for the coordinator's cooking-triggered auto-boost.
+
+    Mirrors :class:`ParmairSummerAutoSwitch`: pure local state (the coordinator
+    reads ``cooking_auto_boost_enabled`` when a detection starts/ends), default
+    OFF, restored across restarts.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:fan-plus"
+    _requires_register = False
+
+    def __init__(self, coordinator: ParmairCoordinator) -> None:
+        super().__init__(coordinator, "cooking_auto_boost")
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.cooking_auto_boost_enabled
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.cooking_auto_boost_enabled = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.cooking_auto_boost_enabled = False
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is not None:
+            self.coordinator.cooking_auto_boost_enabled = last_state.state == "on"

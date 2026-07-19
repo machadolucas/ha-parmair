@@ -27,6 +27,9 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
+    DEFAULT_COOKING_MIN_BOOST_MIN,
+    DEFAULT_COOKING_OFF_DELAY_MIN,
+    DEFAULT_COOKING_SENSITIVITY,
     DEFAULT_SUMMER_AUTO_OFF_DWELL_MIN,
     DEFAULT_SUMMER_AUTO_OFF_TEMP_C,
     DEFAULT_SUMMER_AUTO_ON_DWELL_MIN,
@@ -238,6 +241,56 @@ SUMMER_AUTO_DESCRIPTIONS: tuple[ParmairSummerAutoNumberDescription, ...] = (
 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class ParmairCookingNumberDescription(NumberEntityDescription):
+    """Describes one local cooking-detection tuning number.
+
+    ``params_field`` names the :class:`~.cooking_detect.CookingParams` field
+    this number drives (updated on the coordinator via ``dataclasses.replace``),
+    mirroring :class:`ParmairSummerAutoNumberDescription`. ``cooking_min_boost_minutes``
+    isn't part of the frozen detector params at all — it's boost-restore glue,
+    not detector math — so it sets ``params_field=None`` and instead names a
+    plain ``coordinator`` attribute via ``attr_field``.
+    """
+
+    mode: NumberMode = NumberMode.BOX
+    entity_category: EntityCategory | None = EntityCategory.CONFIG
+    params_field: str | None
+    attr_field: str | None = None
+    default: float
+
+
+COOKING_DESCRIPTIONS: tuple[ParmairCookingNumberDescription, ...] = (
+    ParmairCookingNumberDescription(
+        key="cooking_sensitivity",
+        params_field="sensitivity",
+        default=DEFAULT_COOKING_SENSITIVITY,
+        native_min_value=1,
+        native_max_value=10,
+        native_step=1,
+    ),
+    ParmairCookingNumberDescription(
+        key="cooking_off_delay",
+        params_field="off_delay_min",
+        default=DEFAULT_COOKING_OFF_DELAY_MIN,
+        native_min_value=1,
+        native_max_value=30,
+        native_step=1,
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+    ),
+    ParmairCookingNumberDescription(
+        key="cooking_min_boost_minutes",
+        params_field=None,
+        attr_field="cooking_min_boost_run_min",
+        default=DEFAULT_COOKING_MIN_BOOST_MIN,
+        native_min_value=0,
+        native_max_value=60,
+        native_step=1,
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+    ),
+)
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ParmairConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -255,6 +308,10 @@ async def async_setup_entry(
         ParmairSummerAutoNumber(coordinator, description)
         for description in SUMMER_AUTO_DESCRIPTIONS
     )
+    if coordinator.cooking_configured:
+        entities.extend(
+            ParmairCookingNumber(coordinator, description) for description in COOKING_DESCRIPTIONS
+        )
     async_add_entities(entities)
 
 
@@ -318,3 +375,52 @@ class ParmairSummerAutoNumber(ParmairEntity, RestoreNumber):
         self.coordinator.summer_auto_params = replace(
             self.coordinator.summer_auto_params, **{self.entity_description.params_field: value}
         )
+
+
+class ParmairCookingNumber(ParmairEntity, RestoreNumber):
+    """Local cooking-detection tuning number.
+
+    Drives either ``coordinator.cooking_params`` (via the description's
+    ``params_field``) or a plain coordinator attribute (via ``attr_field``),
+    mirroring :class:`ParmairSummerAutoNumber` but supporting both targets —
+    see :class:`ParmairCookingNumberDescription`.
+    """
+
+    entity_description: ParmairCookingNumberDescription
+    _requires_register = False
+
+    def __init__(
+        self, coordinator: ParmairCoordinator, description: ParmairCookingNumberDescription
+    ) -> None:
+        self.entity_description = description
+        super().__init__(coordinator, description.key)
+        self._native_value = description.default
+
+    @property
+    def native_value(self) -> float | None:
+        return self._native_value
+
+    def _apply(self, value: float) -> None:
+        description = self.entity_description
+        if description.params_field is not None:
+            self.coordinator.cooking_params = replace(
+                self.coordinator.cooking_params, **{description.params_field: value}
+            )
+        else:
+            setattr(self.coordinator, description.attr_field, value)
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._native_value = value
+        self._apply(value)
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_data = await self.async_get_last_number_data()
+        value = (
+            last_data.native_value
+            if last_data is not None and last_data.native_value is not None
+            else self.entity_description.default
+        )
+        self._native_value = value
+        self._apply(value)
