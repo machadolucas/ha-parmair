@@ -205,12 +205,15 @@ airflow on the right — stacking to a single column on narrow cards
 - **Airflow panel** (`show_airflow`) — an animated SVG cross-flow diagram
   with wide gradient flow channels (Fresh→Supply and Extract→Waste crossing
   through the heat-exchanger core). Endpoint and core temperatures sit on
-  frosted-glass overlay labels, and each channel's blue↔amber gradient
-  follows the *measured* temperatures — the colder end is blue, the warmer
-  end amber, flipping automatically between winter and summer. The dash
-  animation speed tracks the current fan speed (faster at higher speeds,
-  frozen when the unit is off). `show_metrics` adds the labeled "Heat
-  recovery" row below the diagram.
+  frosted-glass overlay labels — each one tappable for its entity's
+  more-info dialog — and each channel's blue↔amber gradient follows the
+  *measured* temperatures — the colder end is blue, the warmer end amber,
+  flipping automatically between winter and summer. The dash animation
+  speed tracks the current fan speed (faster at higher speeds, frozen when
+  the unit is off), and the moving dashes hold their phase across state
+  updates instead of jumping on every refresh. `show_metrics` adds the
+  heat-recovery efficiency percentage under the core temperature, tinted
+  from pale red (50%) to pale green (100%) as a quick-glance gauge.
 - **Settings section** (the "…" button) — expands below the panels: a
   full-width Power row (turning off needs a second tap on a red
   "Turn off?" pill within 4 s; turning on is a single tap and stays

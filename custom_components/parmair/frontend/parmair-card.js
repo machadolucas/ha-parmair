@@ -142,6 +142,9 @@ const CARD_CSS = `
     box-sizing: border-box; }
   .panel.dimmed { opacity: 0.45; }
   .airflow-panel.dimmed { pointer-events: none; }
+  /* Temperature pills stay tappable (more-info) even while the fan-off
+     dimming above disables the rest of the panel. */
+  .airflow-panel.dimmed .ep { pointer-events: auto; }
 
   .speed-row { display: flex; align-items: center; gap: 6px; }
   .speed-label { flex: 0 0 auto; font-size: 0.78em; font-weight: 600; color: var(--secondary-text-color); }
@@ -185,7 +188,8 @@ const CARD_CSS = `
      .flow-paused (fan off / speed 0) freezes the dashes in place. */
   .flow-dash { fill: none; stroke-width: 5; stroke-linecap: round; stroke-dasharray: 4 8;
     animation: parmair-flow 1.6s linear infinite;
-    animation-duration: var(--flow-duration, 1.6s); }
+    animation-duration: var(--flow-duration, 1.6s);
+    animation-delay: var(--flow-delay, 0s); }
   .flow-paused .flow-dash { animation-play-state: paused; }
   @keyframes parmair-flow { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -24; } }
   @media (prefers-reduced-motion: reduce) { .flow-dash { animation: none; } }
@@ -203,12 +207,7 @@ const CARD_CSS = `
   .ep-core { top: 50%; left: 50%; transform: translate(-50%, -50%); flex-direction: column;
     align-items: center; gap: 0; padding: 4px 10px; border-radius: 12px; }
   .ep-core .ep-l { font-size: 10px; }
-
-  .metrics { display: flex; flex-direction: column; gap: 4px; }
-  .metric-row { display: flex; align-items: baseline; justify-content: space-between;
-    font-size: 0.84em; }
-  .metric-label { color: var(--secondary-text-color); }
-  .metric-value { color: var(--primary-text-color); font-weight: 600; }
+  .ep-core .ep-r { font-size: 11px; font-weight: 600; }
 
   ha-card.more-grid { display: grid;
     grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 4px 14px;
@@ -257,7 +256,58 @@ const WARM = "var(--warning-color, #e6a23c)";
 // hot/cold side — both ends get this neutral mid blend instead.
 const NEUTRAL = `color-mix(in srgb, ${COOL} 50%, ${WARM})`;
 
+// Every entity key the card ever reads in rendering or click handling —
+// used to narrow `_relevantStates()` below. The device carries plenty of
+// entities the card never touches (fan outputs, humidity averages, timers,
+// diagnostics); without this allowlist any of those changing would still
+// force a full innerHTML rebuild.
+const KEYS_RENDERED = [
+  "fan",
+  "fan_speed_state",
+  "hru_humidity",
+  "co2",
+  "summer_mode",
+  "summer_auto",
+  "hru_temperature_control",
+  "post_heating",
+  "defrosting",
+  "cooking_detected",
+  "home",
+  "control_state",
+  "fresh_air_temperature",
+  "supply_temperature",
+  "extract_temperature",
+  "waste_temperature",
+  "supply_temperature_after_hru",
+  "heat_recovery_efficiency",
+  "home_speed",
+  "away_speed",
+  "supply_temperature_target",
+  "extract_temperature_target",
+  "defrost_min_efficiency",
+  "filter_change_required",
+  "filter_next_change",
+  "alarm",
+  "acknowledge_alarms",
+  "boost",
+  "boost_time_remaining",
+  "boost_duration",
+  "fireplace",
+  "fireplace_time_remaining",
+  "fireplace_duration",
+];
+
 class ParmairCard extends HTMLElement {
+  constructor() {
+    super();
+    // Flow-dash animation phase, carried across innerHTML rebuilds — see
+    // `_flowPhaseVars`.
+    this._flowPhase = 0;
+    this._flowPhaseAt = null;
+    this._flowDur = 0;
+    this._flowRunning = false;
+  }
+
   setConfig(config) {
     const cfg = { ...(config || {}) };
     // Back-compat: older configs used `show_temperatures`/`show_chips`; only
@@ -560,8 +610,43 @@ class ParmairCard extends HTMLElement {
     return a < b ? [COOL, WARM] : [WARM, COOL];
   }
 
-  _epOverlayHtml(posClass, label, value) {
-    return `<div class="ep ${posClass}"><span class="ep-l">${esc(label)}</span><span class="ep-v">${value}</span></div>`;
+  // Heat-recovery efficiency gauge tint: 100% -> pale green, 50% -> pale
+  // red, both desaturated/tinted-white pastels so the number stays readable
+  // on the blurred pill in both light and dark themes. Non-numeric input
+  // returns "" so the caller omits the style attribute and falls back to
+  // the pill's default text color.
+  _recoveryColor(pct) {
+    const n = Number(pct);
+    if (!Number.isFinite(n)) return "";
+    const clamped = Math.max(50, Math.min(100, n));
+    const t = (clamped - 50) / 50;
+    const hue = t * 120;
+    return `hsl(${Math.round(hue)} 45% 78%)`;
+  }
+
+  _epOverlayHtml(posClass, label, value, key) {
+    const moreInfo = this._has(key) ? ` data-more-info="${key}"` : "";
+    return `<div class="ep ${posClass}"${moreInfo}><span class="ep-l">${esc(label)}</span><span class="ep-v">${value}</span></div>`;
+  }
+
+  // Every render tears down and recreates the flow-dash SVG paths, which
+  // restarts their CSS keyframe animation at phase 0 — visible as the dash
+  // pattern jumping on every coordinator poll (~10s), and again whenever a
+  // fan-speed change remaps `--flow-duration` mid-animation. Fix: track how
+  // much phase has elapsed ourselves and re-express it as a negative
+  // animation-delay, so the freshly (re)created element picks up mid-cycle
+  // instead of restarting. Phase only advances while previously running —
+  // paused stays frozen — and is stored as a 0..1 fraction of one cycle.
+  _flowPhaseVars(running, duration) {
+    const now = performance.now();
+    if (this._flowRunning && this._flowPhaseAt != null && this._flowDur > 0) {
+      const elapsedCycles = (now - this._flowPhaseAt) / 1000 / this._flowDur;
+      this._flowPhase = (this._flowPhase + elapsedCycles) % 1;
+    }
+    this._flowPhaseAt = now;
+    this._flowDur = duration;
+    this._flowRunning = running;
+    return `--flow-duration:${duration}s;--flow-delay:-${(this._flowPhase * duration).toFixed(3)}s`;
   }
 
   _airflowHtml() {
@@ -570,6 +655,18 @@ class ParmairCard extends HTMLElement {
     const extractRaw = this._raw("extract_temperature");
     const wasteRaw = this._raw("waste_temperature");
     const core = fmtTemp(this._raw("supply_temperature_after_hru"));
+    const coreMoreInfo = this._has("supply_temperature_after_hru")
+      ? ` data-more-info="supply_temperature_after_hru"`
+      : "";
+    // Heat-recovery % lives inside the core pill, under the "core" label —
+    // gated by `show_metrics` (the row it used to occupy is gone).
+    let recoveryHtml = "";
+    if (this._config.show_metrics && this._has("heat_recovery_efficiency")) {
+      const recoveryRaw = this._raw("heat_recovery_efficiency");
+      const color = this._recoveryColor(recoveryRaw);
+      const style = color ? ` style="color:${color}"` : "";
+      recoveryHtml = `<span class="ep-r" data-more-info="heat_recovery_efficiency"${style}>${fmt0(recoveryRaw)}%</span>`;
+    }
     // Fresh->Supply: outdoor default cool->warm; Extract->Waste the reverse.
     const [fsStart, fsEnd] = this._flowColors(freshRaw, supplyRaw, [COOL, WARM]);
     const [ewStart, ewEnd] = this._flowColors(extractRaw, wasteRaw, [WARM, COOL]);
@@ -581,10 +678,11 @@ class ParmairCard extends HTMLElement {
     const running = this._isOn("fan") && speed != null && speed > 0;
     const duration = running ? (4 / speed).toFixed(2) : "1.6";
     const pausedCls = running ? "" : " flow-paused";
+    const flowVars = this._flowPhaseVars(running, Number(duration));
     // The temperature labels are HTML overlays (not SVG <text>) so they can
     // carry a backdrop-filter blur — SVG text can't — keeping them readable
     // where they sit on top of the wide flow channels.
-    return `<div class="airflow-wrap${pausedCls}" style="--flow-duration:${duration}s">
+    return `<div class="airflow-wrap${pausedCls}" style="${flowVars}">
       <svg class="airflow-svg" viewBox="0 0 280 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
         <defs>
           <linearGradient id="pg-fs" gradientUnits="userSpaceOnUse" x1="${AIRFLOW_FRESH.x}" y1="${AIRFLOW_FRESH.y}" x2="${AIRFLOW_SUPPLY.x}" y2="${AIRFLOW_SUPPLY.y}">
@@ -601,31 +699,17 @@ class ParmairCard extends HTMLElement {
         <path class="flow-base" d="${extractWastePath}" stroke="url(#pg-ew)"></path>
         <path class="flow-dash" d="${extractWastePath}" stroke="url(#pg-ew)"></path>
       </svg>
-      ${this._epOverlayHtml("ep-tl", "Fresh", fmtTemp(freshRaw))}
-      ${this._epOverlayHtml("ep-tr", "Extract", fmtTemp(extractRaw))}
-      ${this._epOverlayHtml("ep-bl", "Waste", fmtTemp(wasteRaw))}
-      ${this._epOverlayHtml("ep-br", "Supply", fmtTemp(supplyRaw))}
-      <div class="ep ep-core"><span class="ep-v">${core}</span><span class="ep-l">core</span></div>
-    </div>`;
-  }
-
-  _metricsHtml() {
-    const heatRecovery = this._has("heat_recovery_efficiency")
-      ? `${fmt0(this._raw("heat_recovery_efficiency"))}%`
-      : "–";
-    const moreInfo = this._has("heat_recovery_efficiency")
-      ? ` data-more-info="heat_recovery_efficiency"`
-      : "";
-    return `<div class="metrics">
-      <div class="metric-row"><span class="metric-label"${moreInfo}>Heat recovery</span><span class="metric-value">${heatRecovery}</span></div>
+      ${this._epOverlayHtml("ep-tl", "Fresh", fmtTemp(freshRaw), "fresh_air_temperature")}
+      ${this._epOverlayHtml("ep-tr", "Extract", fmtTemp(extractRaw), "extract_temperature")}
+      ${this._epOverlayHtml("ep-bl", "Waste", fmtTemp(wasteRaw), "waste_temperature")}
+      ${this._epOverlayHtml("ep-br", "Supply", fmtTemp(supplyRaw), "supply_temperature")}
+      <div class="ep ep-core"${coreMoreInfo}><span class="ep-v">${core}</span><span class="ep-l">core</span>${recoveryHtml}</div>
     </div>`;
   }
 
   _airflowPanelHtml() {
     const dimmed = !this._isOn("fan") ? " dimmed" : "";
-    const parts = [this._airflowHtml()];
-    if (this._config.show_metrics) parts.push(this._metricsHtml());
-    return `<ha-card class="panel airflow-panel${dimmed}">${parts.join("")}</ha-card>`;
+    return `<ha-card class="panel airflow-panel${dimmed}">${this._airflowHtml()}</ha-card>`;
   }
 
   // ---- rendering: expandable settings section -------------------------------
@@ -747,7 +831,12 @@ class ParmairCard extends HTMLElement {
   // every state change) avoids rebuilding the DOM on unrelated bus noise.
   _relevantStates() {
     if (!this._entities) return [];
-    return Object.values(this._entities).map((id) => this._hass.states[id]);
+    // Filter on entity *presence* (fixed once discovery finishes), not on
+    // state presence — the array must stay stable-length/stable-order for
+    // the reference comparison in `_shouldRender` to mean anything.
+    return KEYS_RENDERED.map((k) => this._entities[k])
+      .filter(Boolean)
+      .map((id) => this._hass.states[id]);
   }
 
   _shouldRender() {
@@ -977,7 +1066,7 @@ class ParmairCardEditor extends HTMLElement {
       device_id: "Parmair device (auto-detected if empty)",
       title: "Title (optional)",
       show_airflow: "Show airflow diagram",
-      show_metrics: "Show heat recovery row",
+      show_metrics: "Show heat recovery",
       show_alerts: "Show filter / alarm banners",
       compact: "Compact (header + controls only)",
     };
