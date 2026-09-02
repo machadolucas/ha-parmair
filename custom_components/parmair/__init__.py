@@ -1,9 +1,10 @@
 """The Parmair MAC integration.
 
-One config entry per physical unit: a single ``ParmairModbusClient`` Modbus
-TCP connection feeds a single :class:`~.coordinator.ParmairCoordinator`, which
-every platform module reads through
-:class:`~.entity.ParmairEntity`.
+One config entry per physical unit. The Modbus unit is *borrowed* from the
+``modbus`` integration, which shares and refcounts one connection per endpoint,
+wrapped in a ``ParmairModbusClient`` for the Multi24's transaction policy, and
+fed to a single :class:`~.coordinator.ParmairCoordinator` that every platform
+module reads through :class:`~.entity.ParmairEntity`.
 """
 
 from __future__ import annotations
@@ -12,9 +13,10 @@ import hashlib
 import logging
 import pathlib
 
+from homeassistant.components.modbus import async_get_unit
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 
 from . import modbus
@@ -135,7 +137,22 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ParmairConfigEntry) -> bool:
     """Set up Parmair MAC from a config entry."""
-    client = modbus.create_client(entry.data[CONF_HOST], entry.data[CONF_PORT])
+    host = entry.data[CONF_HOST]
+    port = int(entry.data[CONF_PORT])
+
+    # Borrowing does no I/O, so an unreachable unit does not fail here — the
+    # first read in async_setup() below is what proves it answers.
+    try:
+        unit = async_get_unit(hass, entry, modbus.tcp_params(host, port), modbus.UNIT_ID_DEFAULT)
+    except HomeAssistantError as err:
+        # Something else already holds this endpoint with different link
+        # settings, which one connection cannot honour. Retrying cannot fix
+        # that; the user has to reconcile the two configurations.
+        raise ConfigEntryError(
+            f"Cannot share the Modbus connection to {host}:{port}: {err}"
+        ) from err
+
+    client = modbus.create_client(unit)
     capabilities = Capabilities.from_dict(entry.data[CONF_CAPABILITIES])
     register_map = REGISTER_MAPS[entry.data.get(CONF_REGISTER_MAP, DEFAULT_MAP)]
     coordinator = ParmairCoordinator(hass, entry, client, register_map, capabilities)
@@ -143,7 +160,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ParmairConfigEntry) -> b
     try:
         await coordinator.async_setup()
     except ParmairConnectionError as err:
-        raise ConfigEntryNotReady(f"Cannot connect to Parmair unit: {err}") from err
+        raise ConfigEntryNotReady(
+            f"Cannot connect to Parmair unit at {host}:{port}: {err}"
+        ) from err
 
     # Registered explicitly (not left to an entity's device_info) so the
     # device exists from setup on regardless of which entities get created
@@ -168,7 +187,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ParmairConfigEntry) -> b
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ParmairConfigEntry) -> bool:
-    """Unload a config entry: platforms, then the coordinator's connection."""
+    """Unload a config entry: platforms, then release the borrowed unit.
+
+    ``client.close()`` only gives up our hold; the shared connection is closed
+    by the ``modbus`` integration's own ``entry.async_on_unload`` release, which
+    runs after this and only when no other entry still holds a unit on it.
+    """
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         coordinator = entry.runtime_data

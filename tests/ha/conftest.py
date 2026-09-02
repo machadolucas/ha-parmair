@@ -9,8 +9,9 @@ gaps/capability-gating actually lay out in practice.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from homeassistant.const import CONF_HOST, CONF_PORT
@@ -32,6 +33,30 @@ from custom_components.parmair.registers import MAP_V1_87, decode
 def auto_enable_custom_integrations(enable_custom_integrations):
     """Load the custom integration in every HA test."""
     yield
+
+
+@pytest.fixture(autouse=True)
+def mock_modbus_borrow():
+    """Stub the shared-connection borrow in every HA test.
+
+    The behavioural double is :class:`FakeModbusClient`, patched in over
+    ``modbus.create_client``, so the borrowed unit is never actually used.
+    Stubbing the borrow keeps the HA suite off core's connection registry —
+    no refcounts, no dependence on its per-endpoint mismatch semantics. Tests
+    that need the real borrow (e.g. the mismatch error path) nest their own
+    ``patch`` over this one.
+    """
+    unit = MagicMock()
+
+    @asynccontextmanager
+    async def _temporary_unit(*_args: Any, **_kwargs: Any) -> Any:
+        yield unit
+
+    with (
+        patch("custom_components.parmair.async_get_unit", return_value=unit),
+        patch("custom_components.parmair.config_flow.async_get_temporary_unit", _temporary_unit),
+    ):
+        yield unit
 
 
 def w(value: int) -> int:
@@ -167,11 +192,15 @@ class FakeModbusClient:
     """In-memory stand-in for :class:`~custom_components.parmair.modbus.ParmairModbusClient`.
 
     Implements the exact surface the coordinator depends on (``connect``,
-    ``close``, ``read_block``, ``write_register``, ``connected``) so
-    ``__init__.py``/``coordinator.py`` never notice they're not talking to a
-    real Modbus TCP connection. ``bank`` is keyed by on-wire address; writes
-    are applied back into it so a subsequent verify-read observes them, just
-    like the real controller.
+    ``close``, ``read_block``, ``write_register``, ``connected``,
+    ``link_drops``) so ``__init__.py``/``coordinator.py`` never notice they're
+    not talking to a real Modbus connection. ``bank`` is keyed by on-wire
+    address; writes are applied back into it so a subsequent verify-read
+    observes them, just like the real controller.
+
+    ``close`` clears ``connected`` here purely so the double stays
+    self-consistent; the real client leaves the shared link alone (it only
+    gives up its hold), which ``tests/test_modbus.py`` pins directly.
     """
 
     def __init__(self, bank: dict[int, int]) -> None:
@@ -183,6 +212,7 @@ class FakeModbusClient:
         self.connect_calls = 0
         self.read_calls = 0
         self.close_calls = 0
+        self.link_drops = 0
         self.read_log: list[tuple[int, int]] = []
         self._connected = False
 

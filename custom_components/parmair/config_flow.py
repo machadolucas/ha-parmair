@@ -17,10 +17,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import voluptuous as vol
+from homeassistant.components.modbus import async_get_temporary_unit
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import selector
+from modbus_connection import ModbusUnit
 
 from . import modbus
 from .capabilities import (
@@ -82,15 +85,20 @@ class ProbeResult:
     register_map: str
 
 
-async def async_probe_device(host: str, port: int) -> ProbeResult:
-    """Connect once, read the static + probe registers, and detect capabilities.
+async def async_probe_device(unit: ModbusUnit) -> ProbeResult:
+    """Read the static + probe registers off ``unit`` and detect capabilities.
 
-    Shared by the user flow and the options flow's redetect step. Raises
-    :class:`~.modbus.ParmairConnectionError` for any transport failure
-    (connect or read) and :class:`NotParmairError` when the connection
-    succeeds but the static registers don't look like a Parmair MAC unit.
+    Shared by the user flow and the options flow's redetect step. Both borrow a
+    temporary unit: for a host nothing is configured for yet that opens a
+    connection and closes it again, and for a host a live entry already holds it
+    shares that connection — so redetect no longer opens a second client to a
+    controller the coordinator is polling.
+
+    Raises :class:`~.modbus.ParmairConnectionError` for any transport failure
+    and :class:`NotParmairError` when the unit answers but the static registers
+    don't look like a Parmair MAC.
     """
-    client = modbus.create_client(host, port)
+    client = modbus.create_client(unit)
     try:
         await client.connect()
 
@@ -230,10 +238,13 @@ class ParmairConfigFlow(ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(f"{host}:{port}")
             self._abort_if_unique_id_configured()
             try:
-                probe = await async_probe_device(host, port)
+                async with async_get_temporary_unit(
+                    self.hass, modbus.tcp_params(host, port), modbus.UNIT_ID_DEFAULT
+                ) as unit:
+                    probe = await async_probe_device(unit)
             except NotParmairError:
                 errors["base"] = "not_parmair"
-            except ParmairConnectionError:
+            except ParmairConnectionError, HomeAssistantError:
                 errors["base"] = "cannot_connect"
             else:
                 self._user_input = user_input
@@ -297,10 +308,20 @@ class ParmairOptionsFlow(OptionsFlow):
         if user_input is not None:
             if user_input.get(CONF_REDETECT):
                 try:
-                    probe = await async_probe_device(
-                        self.config_entry.data[CONF_HOST], self.config_entry.data[CONF_PORT]
-                    )
-                except (ParmairConnectionError, NotParmairError):
+                    # A temporary hold shares the connection the live entry
+                    # already holds, so the probe rides the coordinator's
+                    # socket rather than opening a second client to the same
+                    # controller (which corrupts both), and releases cleanly.
+                    async with async_get_temporary_unit(
+                        self.hass,
+                        modbus.tcp_params(
+                            self.config_entry.data[CONF_HOST],
+                            int(self.config_entry.data[CONF_PORT]),
+                        ),
+                        modbus.UNIT_ID_DEFAULT,
+                    ) as unit:
+                        probe = await async_probe_device(unit)
+                except ParmairConnectionError, NotParmairError, HomeAssistantError:
                     errors["base"] = "cannot_connect"
                 else:
                     self.hass.config_entries.async_update_entry(

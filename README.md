@@ -54,13 +54,22 @@ debugging):
   (`IV01_CONTROLSTATE_FO`, register 185, lives at address 1185).
 - Modbus **unit id 0**.
 - The controller is slow: transactions are serialized, paced ≥ 0.3 s apart
-  and retried with reconnects. Values are polled in a handful of bulk block
-  reads (default every 10 s).
+  and retried, discarding a wedged link in between. Values are polled in a
+  handful of bulk block reads (default every 10 s).
+- The connection is **shared**. The integration borrows its Modbus unit from
+  Home Assistant's own `modbus` integration, so any other integration talking
+  to the same host and port rides the same socket and takes its turn, instead
+  of the two fighting over the bus.
 - ⚠ The Multi24's TCP stack misbehaves with **multiple simultaneous Modbus
-  clients** (responses can leak between connections). Remove any other
-  Modbus integration/poller for the unit before setting this one up.
+  clients** (responses can leak between connections). Sharing solves this only
+  for integrations that borrow the same way — remove any *other* Modbus poller
+  for the unit (a script, Node-RED, a second HA) before setting this one up.
 
 ## Installation
+
+**Requires Home Assistant 2026.9 or newer**, whose `modbus` integration
+provides the shared connection this integration borrows from. Nothing needs to
+be configured in it — no `modbus:` YAML, no separate setup.
 
 ### HACS (custom repository)
 
@@ -252,13 +261,17 @@ internally — the integration handles the offset (matches the panel).
 ## Troubleshooting
 
 - **cannot_connect** — check IP/port 502, VLAN/firewall rules, and that no
-  other Modbus client is connected to the unit.
+  other Modbus client is connected to the unit. It also covers the case where
+  another integration already holds the same host and port with incompatible
+  connection settings, which one shared connection cannot serve.
 - **not_parmair** — the device answered but the register map didn't match
   (machine type / software version implausible). Open an issue with your
   unit model and, if possible, a register dump.
 - **Entities unavailable after working** — the integration retries and
-  reconnects automatically; a *connection lost* repair issue appears after
-  ~5 failed cycles. Check the network path and other Modbus clients.
+  re-establishes the link automatically on the next poll (it deliberately does
+  *not* reload itself when a connection drops, which would churn every entity);
+  a *connection lost* repair issue appears after ~5 fully failed cycles. Check
+  the network path and other Modbus clients.
 - **CO₂ looks ~500 ppm too high/low** — set the CO₂ offset option (see
   above).
 - Download **diagnostics** from the device page and attach it to bug
@@ -267,16 +280,17 @@ internally — the integration handles the offset (matches the panel).
 ## Development
 
 ```bash
-uv venv --python 3.13 .venv313
-uv pip install --python .venv313/bin/python -r requirements_test.txt
-.venv313/bin/python -m pytest --cov=custom_components/parmair --cov-fail-under=90
-.venv313/bin/ruff check . && .venv313/bin/ruff format --check .
+uv venv --python 3.14 .venv314
+uv pip install --python .venv314/bin/python -r requirements_test.txt
+.venv314/bin/python -m pytest --cov=custom_components/parmair --cov-fail-under=90
+.venv314/bin/ruff check . && .venv314/bin/ruff format --check .
 ```
 
 Pure logic (register map, capability detection, summer-mode state machine)
 lives in HA-free modules with plain pytest tests; HA behavior is tested with
 `pytest-homeassistant-custom-component` against a fake Modbus client seeded
-with values captured from a real REXO 120. See `CLAUDE.md` for architecture
+with values captured from a real REXO 120. The transport itself is tested
+against `modbus_connection`'s own in-memory mock unit. See `CLAUDE.md` for architecture
 notes and contribution conventions.
 
 ## License

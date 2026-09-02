@@ -1,7 +1,8 @@
 """Polling + write coordinator for the Parmair MAC integration.
 
 One coordinator per config entry, holding the single ``ParmairModbusClient``
-connection to the unit. Each poll tick reads the dynamic-register blocks
+that wraps the Modbus unit borrowed from the ``modbus`` integration (see
+``__init__.py``). Each poll tick reads the dynamic-register blocks
 planned in :meth:`ParmairCoordinator.async_setup` (``registers.build_read_plan``,
 gated by the unit's detected :class:`~.capabilities.Capabilities`), decodes
 them, and merges in the one-shot static-register snapshot. A block read is
@@ -207,11 +208,13 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         return bool(self.config_entry.options.get(CONF_COOKING_SENSORS))
 
     async def async_setup(self) -> None:
-        """Connect, snapshot the static registers, and plan the dynamic poll.
+        """Settle the link, snapshot the static registers, plan the dynamic poll.
 
-        Called once from ``__init__.py`` before the first refresh. Raises
-        :class:`~.modbus.ParmairConnectionError` on a failed connect, which
-        the caller translates to ``ConfigEntryNotReady``.
+        Called once from ``__init__.py`` before the first refresh. The
+        ``client.connect()`` below is the first round trip to the unit —
+        borrowing one does no I/O — so it raises
+        :class:`~.modbus.ParmairConnectionError` when the unit is unreachable,
+        which the caller translates to ``ConfigEntryNotReady``.
         """
         await self.client.connect()
 
@@ -372,7 +375,7 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
             return None
         try:
             return float(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
 
     # ── Cooking detection ────────────────────────────────────────────────

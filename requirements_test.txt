@@ -1,9 +1,17 @@
 # Test + lint dependencies (CI). The pure-module tests need only pytest;
 # pytest-homeassistant-custom-component pulls Home Assistant for the HA-side
-# tests. pymodbus is a runtime requirement of the integration itself (modbus.py
-# imports it), so the HA test suite needs it installed too.
+# tests. Pinned because async_get_unit (the shared Modbus connection helper)
+# only exists from HA 2026.9 — an older phcc fails as a confusing ImportError.
 pytest>=8.0
 pytest-cov>=5.0
-pytest-homeassistant-custom-component
-pymodbus>=3.11.0
+pytest-homeassistant-custom-component>=0.13.362
 ruff>=0.6
+
+# Mirrors homeassistant/components/modbus/manifest.json. Our manifest declares
+# dependencies: ["modbus"], so HA imports that component (which needs pymodbus
+# for the YAML hub) and its connection helper (modbus_connection/tmodbus).
+# Tests run with skip_pip, so nothing installs these for us. Bump in lockstep
+# with core's modbus manifest.
+pymodbus==3.13.1
+modbus-connection[tmodbus]==4.10.0
+tmodbus==0.6.2

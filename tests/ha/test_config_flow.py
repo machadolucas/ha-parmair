@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from contextlib import asynccontextmanager
+from unittest.mock import MagicMock, patch
 
 from conftest import FakeModbusClient
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.exceptions import HomeAssistantError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.parmair.const import (
@@ -21,6 +23,7 @@ from custom_components.parmair.const import (
     CONF_SUMMER_AUTO_SOURCE,
     DOMAIN,
 )
+from custom_components.parmair.modbus import UNIT_ID_DEFAULT, tcp_params
 
 _HOST = "192.168.101.56"
 _PORT = 502
@@ -296,3 +299,43 @@ async def test_options_flow_sets_and_clears_cooking_sensors(
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert CONF_COOKING_SENSORS not in entry.options
+
+
+async def test_probe_borrows_a_temporary_unit_for_the_entered_endpoint(
+    hass: HomeAssistant, rexo120_bank: dict[int, int]
+) -> None:
+    """The user flow has no entry to tie a hold to, so it takes a temporary one.
+
+    Nests its own patch over the autouse ``mock_modbus_borrow`` fixture to
+    assert what the real call site passes.
+    """
+    unit = MagicMock()
+
+    @asynccontextmanager
+    async def temporary_unit(_hass, params, unit_id):
+        borrows.append((params, unit_id))
+        yield unit
+
+    borrows: list[tuple[object, int]] = []
+
+    with patch("custom_components.parmair.config_flow.async_get_temporary_unit", temporary_unit):
+        await _start_and_probe(hass, rexo120_bank)
+
+    assert borrows == [
+        (tcp_params(_USER_INPUT[CONF_HOST], _USER_INPUT[CONF_PORT]), UNIT_ID_DEFAULT)
+    ]
+
+
+async def test_probe_reports_a_borrow_conflict_as_cannot_connect(
+    hass: HomeAssistant, rexo120_bank: dict[int, int]
+) -> None:
+    """Another holder with different link settings is a connection problem to the user."""
+    with patch(
+        "custom_components.parmair.config_flow.async_get_temporary_unit",
+        side_effect=HomeAssistantError("already in use with different link settings"),
+    ):
+        result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], _USER_INPUT)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "cannot_connect"}

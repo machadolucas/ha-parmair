@@ -45,6 +45,10 @@ async def async_get_config_entry_diagnostics(
         "stats": {
             "block_failures": coordinator.block_failures,
             "consecutive_full_failures": coordinator.consecutive_full_failures,
+            "connected": coordinator.client.connected,
+            # Drops of the shared link we did not cause (our own retry-time
+            # disconnects don't fire the callback that counts these).
+            "link_drops": coordinator.client.link_drops,
             "last_successful_update": (
                 coordinator.last_successful_update.isoformat()
                 if coordinator.last_successful_update is not None

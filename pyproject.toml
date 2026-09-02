@@ -2,12 +2,13 @@
 testpaths = ["tests"]
 asyncio_mode = "auto"
 # Pure tests (test_registers/test_capabilities/test_summer_auto) load their
-# module via importlib and need only pytest. The HA-side tests under tests/ha/
-# use pytest-homeassistant-custom-component (Python 3.13 — HA does not support
-# 3.14).
+# module via importlib and need only pytest; test_modbus additionally uses
+# modbus_connection's own mock. The HA-side tests under tests/ha/ use
+# pytest-homeassistant-custom-component. Python 3.14 — HA *requires* >=3.14.2
+# as of 2026.8.
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py314"
 line-length = 100
 
 [tool.ruff.lint]

@@ -1,243 +1,310 @@
-"""Pure tests for the Modbus transport: pacing, retries, warm-up, translation.
+"""Pure tests for the Modbus transport policy: warm-up, retries, translation.
 
 ``modbus.py`` is HA-free, so these run with plain pytest (no
-pytest-homeassistant-custom-component) against a small pymodbus double
-(``FakePyModbusClient``) monkeypatched in for ``AsyncModbusTcpClient``. The
-double always returns the *same* instance regardless of constructor args —
-standing in for "the same physical controller" across the module's
-close+reconnect cycle, since ``connect()`` always builds a fresh
-``AsyncModbusTcpClient`` object.
+pytest-homeassistant-custom-component) against ``modbus_connection``'s own
+in-memory ``MockModbusUnit`` — the same double the library ships for device
+libraries built on it, which keeps the fidelity of the stand-in on the library
+authors rather than on a hand-rolled fake.
+
+The client under test does *not* own the link: it wraps a unit borrowed from a
+shared connection. So the invariants here are about policy, not about sockets —
+that a downed link is warmed up before use, that a wedged one is discarded
+between retries but a *answering* one is not, and that closing gives up our
+hold without taking the shared link down.
 """
 
 from __future__ import annotations
 
-import time
+import asyncio
 
 import pytest
-from pymodbus.exceptions import ModbusException
+from modbus_connection import (
+    IllegalDataAddressError,
+    ModbusConnectionError,
+    ModbusDesyncError,
+)
+from modbus_connection.mock import MockModbusConnection, MockModbusUnit
 
 from custom_components.parmair import modbus
 from custom_components.parmair.modbus import ParmairConnectionError, ParmairModbusClient
 
-
-class _FakeResult:
-    def __init__(self, registers: list[int] | None = None, *, error: bool = False) -> None:
-        self.registers = registers or []
-        self._error = error
-
-    def isError(self) -> bool:
-        return self._error
-
-
-class FakePyModbusClient:
-    """Stands in for pymodbus's ``AsyncModbusTcpClient``.
-
-    Scripted via ``read_script``/``write_script``: each entry is either an
-    ``Exception`` instance (raised) or the "wire" outcome (a list of raw
-    words for a read, a bool for a write's success/failure).
-    """
-
-    def __init__(self) -> None:
-        self.connected = False
-        self.connect_should_fail = False
-        self.read_script: list[Exception | list[int]] = []
-        self.write_script: list[Exception | bool] = []
-        self.read_calls: list[tuple[int, int, int]] = []
-        self.write_calls: list[tuple[int, int, int]] = []
-        self.connect_calls = 0
-
-    async def connect(self) -> bool:
-        self.connect_calls += 1
-        if self.connect_should_fail:
-            return False
-        self.connected = True
-        return True
-
-    def close(self) -> None:
-        self.connected = False
-
-    async def read_holding_registers(
-        self,
-        address: int,
-        *,
-        count: int = 1,
-        device_id: int = 1,
-        no_response_expected: bool = False,
-    ) -> _FakeResult:
-        self.read_calls.append((address, count, device_id))
-        outcome = self.read_script.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return _FakeResult(registers=outcome)
-
-    async def write_register(
-        self, address: int, value: int, *, device_id: int = 1, no_response_expected: bool = False
-    ) -> _FakeResult:
-        self.write_calls.append((address, value, device_id))
-        outcome = self.write_script.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return _FakeResult(error=not outcome)
+# The Multi24's unit id; the mock does not care, but reading the real constant
+# keeps this file honest if it ever changes.
+UNIT_ID = modbus.UNIT_ID_DEFAULT
 
 
 @pytest.fixture
-def fake_pymodbus(monkeypatch: pytest.MonkeyPatch) -> FakePyModbusClient:
-    fake = FakePyModbusClient()
-    monkeypatch.setattr(modbus, "AsyncModbusTcpClient", lambda *a, **kw: fake)
-    # Keep the pure suite fast: real backoff/pacing delays aren't the point here
-    # (a dedicated timing test below re-enables INTER_TRANSACTION_DELAY).
+def connection() -> MockModbusConnection:
+    """A fresh in-memory connection (starts disconnected, dials on first use)."""
+    return MockModbusConnection()
+
+
+@pytest.fixture
+def unit(connection: MockModbusConnection) -> MockModbusUnit:
+    """The Parmair unit handle, with the warm-up register present."""
+    handle = connection.for_unit(UNIT_ID)
+    handle.holding[modbus.WARM_UP_ADDRESS] = 1
+    return handle
+
+
+@pytest.fixture
+def client(unit: MockModbusUnit, monkeypatch: pytest.MonkeyPatch) -> ParmairModbusClient:
+    """The client under test, with the real sleeps removed."""
     monkeypatch.setattr(modbus, "WARM_UP_PAUSE", 0)
     monkeypatch.setattr(modbus, "RETRY_BACKOFF", (0, 0))
-    monkeypatch.setattr(modbus, "INTER_TRANSACTION_DELAY", 0)
-    return fake
+    return modbus.create_client(unit)
 
 
-async def test_connect_success_runs_one_warm_up_read(fake_pymodbus: FakePyModbusClient) -> None:
-    fake_pymodbus.read_script = [[42]]
-    client = ParmairModbusClient("host", 502)
-
-    await client.connect()
-
-    assert client.connected is True
-    assert fake_pymodbus.read_calls == [(modbus.WARM_UP_ADDRESS, 1, modbus.UNIT_ID_DEFAULT)]
-
-
-async def test_connect_tolerates_one_warm_up_failure(fake_pymodbus: FakePyModbusClient) -> None:
-    fake_pymodbus.read_script = [ModbusException("first reply flaky"), [42]]
-    client = ParmairModbusClient("host", 502)
-
-    await client.connect()
-
-    assert client.connected is True
-    assert len(fake_pymodbus.read_calls) == 2
+def reads(unit: MockModbusUnit) -> list[tuple[int, int]]:
+    """The (address, count) of every holding-register block read so far."""
+    return [
+        (event.address, event.count)
+        for event in unit.read_events
+        if event.register_type == "holding"
+    ]
 
 
-async def test_connect_warm_up_second_failure_propagates(
-    fake_pymodbus: FakePyModbusClient,
-) -> None:
-    fake_pymodbus.read_script = [ModbusException("one"), ModbusException("two")]
-    client = ParmairModbusClient("host", 502)
-
-    with pytest.raises(ParmairConnectionError):
-        await client.connect()
+# ── construction ─────────────────────────────────────────────────────────
 
 
-async def test_connect_failure_raises_parmair_connection_error(
-    fake_pymodbus: FakePyModbusClient,
-) -> None:
-    fake_pymodbus.connect_should_fail = True
-    client = ParmairModbusClient("host", 502)
-
-    with pytest.raises(ParmairConnectionError):
-        await client.connect()
+def test_construction_sets_the_inter_transaction_spacing(client, unit):
+    """Pacing is delegated to the shared connection, which enforces it bus-wide."""
+    assert unit.message_spacing == modbus.INTER_TRANSACTION_DELAY
 
 
-async def test_close_resets_connected_state(fake_pymodbus: FakePyModbusClient) -> None:
-    fake_pymodbus.read_script = [[1]]
-    client = ParmairModbusClient("host", 502)
-    await client.connect()
-    assert client.connected is True
-
-    await client.close()
-
+def test_construction_does_no_io(client, unit):
+    """Borrowing and wrapping a unit must not touch the link."""
+    assert unit.read_events == []
     assert client.connected is False
 
 
-async def test_read_block_returns_raw_words(fake_pymodbus: FakePyModbusClient) -> None:
-    fake_pymodbus.read_script = [[1], [10, 20, 30]]  # warm-up, then the real read
-    client = ParmairModbusClient("host", 502)
+# ── connect: the eager warm-up round trip ────────────────────────────────
+
+
+async def test_connect_warms_up_the_link(client, unit):
     await client.connect()
-
-    values = await client.read_block(1000, 3)
-
-    assert values == [10, 20, 30]
-
-
-async def test_read_block_retries_after_failures_and_succeeds(
-    fake_pymodbus: FakePyModbusClient,
-) -> None:
-    fake_pymodbus.read_script = [
-        [1],  # connect() warm-up
-        ModbusException("boom"),  # attempt 1 fails
-        [1],  # reconnect warm-up
-        [10, 20],  # attempt 2 succeeds
-    ]
-    client = ParmairModbusClient("host", 502)
-    await client.connect()
-
-    values = await client.read_block(2000, 2)
-
-    assert values == [10, 20]
+    assert reads(unit) == [(modbus.WARM_UP_ADDRESS, 1)]
     assert client.connected is True
 
 
-async def test_read_block_exhausts_retries_and_raises(
-    fake_pymodbus: FakePyModbusClient,
-) -> None:
-    fake_pymodbus.read_script = [
-        [1],  # connect() warm-up
-        ModbusException("1"),  # attempt 1
-        [1],  # reconnect warm-up
-        ModbusException("2"),  # attempt 2
-        [1],  # reconnect warm-up
-        ModbusException("3"),  # attempt 3 (final)
-    ]
-    client = ParmairModbusClient("host", 502)
-    await client.connect()
+async def test_connect_tolerates_one_warm_up_failure(client, unit):
+    """The controller's first reply after a fresh connect is flaky by design."""
+    failures = iter([ModbusConnectionError("flaky first reply")])
 
+    original = unit.read_holding_registers
+
+    async def flaky(address: int, count: int) -> list[int]:
+        result = await original(address, count)
+        if (err := next(failures, None)) is not None:
+            raise err
+        return result
+
+    unit.read_holding_registers = flaky
+
+    await client.connect()
+    assert reads(unit) == [(modbus.WARM_UP_ADDRESS, 1)] * 2
+
+
+async def test_connect_propagates_a_second_warm_up_failure(client, unit):
+    unit.fail_requests(ModbusConnectionError("unit is down"))
+    with pytest.raises(ParmairConnectionError, match="unit is down"):
+        await client.connect()
+
+
+async def test_connect_failure_reports_the_operation(client, unit):
+    """The message names the read, so a log line says what was attempted."""
+    unit.fail_requests(ModbusConnectionError("no route"))
+    with pytest.raises(ParmairConnectionError, match=rf"read {modbus.WARM_UP_ADDRESS}/1 failed"):
+        await client.connect()
+
+
+# ── close: gives up our hold, never the shared link ──────────────────────
+
+
+async def test_close_leaves_the_shared_link_up(client, unit):
+    """The connection is refcounted by the modbus integration, not by us."""
+    await client.connect()
+    await client.close()
+    assert unit.connected is True
+
+
+async def test_close_stops_watching_the_link(client, connection, unit):
+    await client.connect()
+    await client.close()
+    connection.simulate_connection_lost()
+    assert client.link_drops == 0
+
+
+async def test_io_after_close_is_refused(client, unit):
+    await client.connect()
+    await client.close()
+    with pytest.raises(ParmairConnectionError, match="after release"):
+        await client.read_block(1200, 2)
+
+
+# ── reads ────────────────────────────────────────────────────────────────
+
+
+async def test_read_block_returns_raw_words(client, unit):
+    unit.holding.update({1200: 7, 1201: 0xFFFF, 1202: 42})
+    await client.connect()
+    assert await client.read_block(1200, 3) == [7, 0xFFFF, 42]
+
+
+async def test_read_block_warms_up_a_downed_link_first(client, connection, unit):
+    """A drop we did not cause is noticed via ``connected``, not via a flag."""
+    await client.connect()
+    connection.simulate_connection_lost()
+    unit.read_events.clear()
+
+    await client.read_block(1200, 1)
+
+    assert reads(unit) == [(modbus.WARM_UP_ADDRESS, 1), (1200, 1)]
+    assert client.link_drops == 1
+
+
+async def test_read_block_does_not_rewarm_a_live_link(client, unit):
+    await client.connect()
+    unit.read_events.clear()
+    await client.read_block(1200, 1)
+    assert reads(unit) == [(1200, 1)]
+
+
+# ── retries ──────────────────────────────────────────────────────────────
+
+
+async def test_transient_failure_is_retried_after_a_fresh_warm_up(client, unit):
+    """A dropped link is discarded, so the retry dials and re-warms."""
+    await client.connect()
+    unit.read_events.clear()
+    unit.fail_read(1200, ModbusConnectionError("link wedged"))
+
+    async def recover() -> None:
+        await asyncio.sleep(0)
+        unit.fail_read(1200, None)
+
+    task = asyncio.create_task(recover())
+    assert await client.read_block(1200, 1) == [0]
+    await task
+
+    # attempt 1 fails -> disconnect -> attempt 2 re-warms, then succeeds.
+    assert reads(unit) == [(1200, 1), (modbus.WARM_UP_ADDRESS, 1), (1200, 1)]
+
+
+async def test_read_gives_up_after_max_attempts(client, unit):
+    """The unit answers the warm-up but never this block."""
+    await client.connect()
+    unit.fail_read(1200, ModbusConnectionError("gone"))
+    with pytest.raises(ParmairConnectionError, match="gone"):
+        await client.read_block(1200, 1)
+    assert len([r for r in reads(unit) if r == (1200, 1)]) == modbus.MAX_ATTEMPTS
+
+
+async def test_a_link_that_cannot_be_warmed_up_short_circuits_the_read(client, unit):
+    """No point issuing the real read onto a link that just failed to settle."""
+    await client.connect()
+    unit.read_events.clear()
+    unit.fail_requests(ModbusConnectionError("unit is down"))
+
+    with pytest.raises(ParmairConnectionError, match="unit is down"):
+        await client.read_block(1200, 1)
+
+    # Attempt 1 tries the read on the still-live link; every later attempt only
+    # gets as far as the warm-up.
+    assert [r for r in reads(unit) if r == (1200, 1)] == [(1200, 1)]
+
+
+async def test_a_wedged_link_is_dropped_after_the_last_attempt(client, unit):
+    """Giving up must not hand the next transaction a link known to be broken."""
+    await client.connect()
+    unit.fail_requests(ModbusDesyncError("reply for someone else"))
     with pytest.raises(ParmairConnectionError):
-        await client.read_block(3000, 1)
+        await client.read_block(1200, 1)
+    assert unit.connected is False
 
 
-async def test_read_block_translates_error_response(fake_pymodbus: FakePyModbusClient) -> None:
-    """An error *response* (``isError()`` True) is translated just like an exception."""
-    fake_pymodbus.read_script = [[1]]  # connect warm-up
-    client = ParmairModbusClient("host", 502)
+# ── error responses: the device answered, so keep the link ───────────────
+
+
+async def test_error_response_is_translated_and_flagged(client, unit):
     await client.connect()
+    unit.fail_read(1200, IllegalDataAddressError())
+    with pytest.raises(ParmairConnectionError, match="rejected") as excinfo:
+        await client.read_block(1200, 1)
+    assert excinfo.value.device_answered is True
 
-    async def _error_response(*_args, **_kwargs) -> _FakeResult:
-        return _FakeResult(error=True)
 
-    fake_pymodbus.read_holding_registers = _error_response  # type: ignore[method-assign]
-
+async def test_error_response_does_not_drop_the_shared_link(client, unit):
+    """A bad request of ours must not cost co-tenants their connection."""
+    await client.connect()
+    unit.fail_read(1200, IllegalDataAddressError())
     with pytest.raises(ParmairConnectionError):
-        await client.read_block(4000, 1)
+        await client.read_block(1200, 1)
+    assert unit.connected is True
+    assert client.link_drops == 0
 
 
-async def test_write_register_success(fake_pymodbus: FakePyModbusClient) -> None:
-    fake_pymodbus.read_script = [[1]]  # connect warm-up
-    fake_pymodbus.write_script = [True]
-    client = ParmairModbusClient("host", 502)
+# ── timeout ──────────────────────────────────────────────────────────────
+
+
+async def test_a_hanging_request_is_bounded_and_drops_the_link(
+    client, unit, monkeypatch: pytest.MonkeyPatch
+):
+    """Core fixes the connection timeout at 10 s, so the bound has to be ours."""
+    monkeypatch.setattr(modbus, "REQUEST_TIMEOUT", 0.01)
     await client.connect()
 
-    await client.write_register(5000, 123)
+    async def hang(address: int, count: int) -> list[int]:
+        await asyncio.sleep(10)
+        return [0]
 
-    assert fake_pymodbus.write_calls == [(5000, 123, modbus.UNIT_ID_DEFAULT)]
+    unit.read_holding_registers = hang
+
+    with pytest.raises(ParmairConnectionError, match="TimeoutError"):
+        await client.read_block(1200, 1)
+    assert unit.connected is False
 
 
-async def test_write_register_error_response_exhausts_retries(
-    fake_pymodbus: FakePyModbusClient,
-) -> None:
-    fake_pymodbus.read_script = [[1], [1], [1]]  # connect + 2 reconnect warm-ups
-    fake_pymodbus.write_script = [False, False, False]  # every attempt errors
-    client = ParmairModbusClient("host", 502)
+# ── writes ───────────────────────────────────────────────────────────────
+
+
+async def test_write_register_applies_the_value(client, unit):
     await client.connect()
+    await client.write_register(1187, 3)
+    assert unit.holding[1187] == 3
 
-    with pytest.raises(ParmairConnectionError):
-        await client.write_register(6000, 1)
 
-
-async def test_inter_transaction_delay_paces_consecutive_reads(
-    fake_pymodbus: FakePyModbusClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(modbus, "INTER_TRANSACTION_DELAY", 0.2)
-    fake_pymodbus.read_script = [[1], [10], [20]]
-    client = ParmairModbusClient("host", 502)
+async def test_write_register_retries_then_gives_up(client, unit):
     await client.connect()
+    unit.fail_write(1187, ModbusConnectionError("write refused"))
+    with pytest.raises(ParmairConnectionError, match="write 1187=3 failed"):
+        await client.write_register(1187, 3)
 
-    start = time.monotonic()
-    await client.read_block(1000, 1)
-    await client.read_block(1001, 1)
-    elapsed = time.monotonic() - start
 
-    assert elapsed >= 0.2
+# ── the lost-link callback ───────────────────────────────────────────────
+
+
+async def test_a_dropped_link_is_counted_not_reconnected(client, connection, unit):
+    """No reload, no eager redial: recovery happens on the next transaction."""
+    await client.connect()
+    unit.read_events.clear()
+
+    connection.simulate_connection_lost()
+
+    assert client.link_drops == 1
+    assert unit.connected is False
+    assert unit.read_events == []
+
+
+async def test_a_failing_disconnect_does_not_mask_the_real_error(client, unit):
+    """Tearing a link down can itself fail; the transaction error is what matters."""
+    await client.connect()
+    unit.fail_read(1200, ModbusConnectionError("link wedged"))
+
+    async def refuse_to_disconnect() -> None:
+        raise ModbusConnectionError("could not tear the link down")
+
+    unit.disconnect = refuse_to_disconnect
+
+    with pytest.raises(ParmairConnectionError, match="link wedged"):
+        await client.read_block(1200, 1)
