@@ -17,8 +17,8 @@ from homeassistant.components.number import (
     RestoreNumber,
 )
 from homeassistant.const import (
-    CONCENTRATION_PARTS_PER_MILLION,
     PERCENTAGE,
+    UnitOfRatio,
     UnitOfTemperature,
     UnitOfTime,
 )
@@ -89,14 +89,14 @@ DESCRIPTIONS: tuple[ParmairNumberDescription, ...] = (
         native_min_value=100,
         native_max_value=2000,
         native_step=10,
-        native_unit_of_measurement=CONCENTRATION_PARTS_PER_MILLION,
+        native_unit_of_measurement=UnitOfRatio.PARTS_PER_MILLION,
     ),
     ParmairNumberDescription(
         key="co2_boost_max",
         native_min_value=100,
         native_max_value=2000,
         native_step=10,
-        native_unit_of_measurement=CONCENTRATION_PARTS_PER_MILLION,
+        native_unit_of_measurement=UnitOfRatio.PARTS_PER_MILLION,
     ),
     ParmairNumberDescription(
         key="humidity_boost_start",
