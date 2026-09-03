@@ -269,9 +269,13 @@ internally — the integration handles the offset (matches the panel).
   unit model and, if possible, a register dump.
 - **Entities unavailable after working** — the integration retries and
   re-establishes the link automatically on the next poll (it deliberately does
-  *not* reload itself when a connection drops, which would churn every entity);
-  a *connection lost* repair issue appears after ~5 fully failed cycles. Check
-  the network path and other Modbus clients.
+  *not* reload itself when a connection drops, which would churn every entity).
+  A *connection lost* repair issue appears after 5 fully failed cycles, which is
+  **roughly 15-20 minutes**, not seconds: while the unit is unreachable each
+  cycle spends its retries and timeouts before giving up, so it takes far longer
+  than the scan interval. Entities go unavailable well before the repair does.
+  Recovery is automatic once the unit answers again, and the repair clears
+  itself. Check the network path and other Modbus clients.
 - **CO₂ looks ~500 ppm too high/low** — set the CO₂ offset option (see
   above).
 - Download **diagnostics** from the device page and attach it to bug

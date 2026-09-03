@@ -198,11 +198,39 @@ flagged in code comments where relevant):
   pre-write `speed_control = 0`, which is safe either way).
 - Whether the library's 0.3 s `message_spacing` measures end-to-start or
   start-to-start (affects the real poll-cycle duration, not correctness).
-- Whether `REQUEST_TIMEOUT = 5` is the right cap now that the transport no
-  longer sets its own connect timeout.
 - Whether a core `modbus:` YAML hub on the *same* host:port coexists on the
   shared connection. If it does, README's "remove any other Modbus poller"
-  warning can be softened for that case.
+  warning can be softened for that case. **Needs a restart to test**: `modbus`'s
+  `async_setup` returns early when `modbus:` is absent from the config, so
+  `DATA_MODBUS_HUBS` is never created and the `modbus.reload` service refuses
+  ("Modbus cannot reload, because it was never loaded"). A YAML hub can only be
+  brought up at startup.
+
+## Outage timing (measured live, 2026-09-03, v0.5.0)
+
+Blocking the unit at the network level for 16 min and restoring it confirmed the
+recovery path end to end, and measured something worth knowing before touching
+`REQUEST_TIMEOUT`, `RETRY_BACKOFF` or `CONNECTION_LOST_THRESHOLD`:
+
+- **A fully-failed poll cycle takes ~189 s**, not one scan interval. Per block:
+  3 attempts × (2 warm-up reads × `REQUEST_TIMEOUT` + `WARM_UP_PAUSE`) plus
+  `RETRY_BACKOFF` ≈ 32 s, × 6 blocks. The scan interval is irrelevant while
+  failing — the cycle itself is the bottleneck.
+- So `ISSUE_CONNECTION_LOST` (5 consecutive full failures) surfaces **~16.5 min**
+  after the unit goes unreachable, not the ~50 s a 10 s scan interval suggests.
+  Verified: blocked 07:16:55Z → repair raised 07:33:23Z.
+- A cycle straddling the moment connectivity drops is a *partial* success (some
+  blocks answered, some didn't), so it stamps `last_successful_update` and does
+  not count toward the threshold. Expect that timestamp to sit up to ~3 min
+  after connectivity actually died.
+- Recovery needs no reload and no repair-clearing logic of its own: restore at
+  07:37:29Z → first clean cycle 07:40:36Z (the in-flight failed cycle drains
+  first), repair auto-cleared, and `block_failures` **kept** its accumulated
+  value — the proof that the entry did not reload. If that counter ever resets
+  across an outage, something reintroduced reload-on-drop.
+- Every failed block read fails at `read 1244/1` (the warm-up address), not at
+  the block's own address: `_ensure_link()` short-circuits before `op()` is
+  issued onto a link known to be down. That is the expected log signature.
 
 ## Shared Modbus connection (shipped in v0.5.0)
 
