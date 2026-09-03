@@ -196,15 +196,39 @@ flagged in code comments where relevant):
   1=electric).
 - Whether `control_state` writes alone exit manual speed mode (we always
   pre-write `speed_control = 0`, which is safe either way).
-- Whether the library's 0.3 s `message_spacing` measures end-to-start or
-  start-to-start (affects the real poll-cycle duration, not correctness).
-- Whether a core `modbus:` YAML hub on the *same* host:port coexists on the
-  shared connection. If it does, README's "remove any other Modbus poller"
-  warning can be softened for that case. **Needs a restart to test**: `modbus`'s
-  `async_setup` returns early when `modbus:` is absent from the config, so
-  `DATA_MODBUS_HUBS` is never created and the `modbus.reload` service refuses
-  ("Modbus cannot reload, because it was never loaded"). A YAML hub can only be
-  brought up at startup.
+
+## A core `modbus:` YAML hub does NOT share our connection (settled 2026-09-03)
+
+Answered definitively, from source rather than observation: the YAML path
+(`ModbusHub` in `homeassistant/components/modbus/modbus.py`) constructs its own
+pymodbus client — `self._client = self._pb_class[self._config_type](**self._pb_params)`
+— and never touches `connection.py` or `async_get_unit`. So a `modbus:` YAML hub
+pointed at our host:port is a **second, independent TCP client**, exactly the
+condition that corrupts this controller. The sharing in v0.5.0 only applies
+between integrations that borrow through `async_get_unit`.
+
+So README's "remove any other Modbus poller" warning **stays as written** — it
+covers a YAML hub too. Do not soften it.
+
+Tested live anyway (one holding register, 30 s scan interval, alongside our 10 s
+poll): 7 min with no corruption, `block_failures`/`link_drops` both 0. That is
+*not* evidence of safety — the YAML hub issued ~14 requests against our ~1 500,
+so the collision probability was tiny, and the documented cross-talk is
+intermittent. Bringing a YAML hub up also needs a restart: `modbus`'s
+`async_setup` returns early when `modbus:` is absent, so `DATA_MODBUS_HUBS` is
+never created and `modbus.reload` refuses ("Modbus cannot reload, because it was
+never loaded").
+
+## Poll-cycle timing (measured live, 2026-09-03, v0.5.0)
+
+- **A healthy full cycle takes ~1.53 s** for the 6-block plan: 5 inter-request
+  gaps × `INTER_TRANSACTION_DELAY` (1.5 s) plus ~30 ms of actual response time.
+  So the controller answers fast and the pacing dominates the cycle.
+- That also settles how the library paces: `message_spacing` is **end-to-start**
+  (`Pacer` stamps `_last_finished_at` *after* each request completes), so raising
+  `INTER_TRANSACTION_DELAY` adds its full value per request, not per slot.
+- Headroom check: 1.53 s against a 10 s scan interval. `INTER_TRANSACTION_DELAY`
+  could roughly quintuple before a cycle overran the interval.
 
 ## Outage timing (measured live, 2026-09-03, v0.5.0)
 

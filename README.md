@@ -62,8 +62,11 @@ debugging):
   of the two fighting over the bus.
 - ⚠ The Multi24's TCP stack misbehaves with **multiple simultaneous Modbus
   clients** (responses can leak between connections). Sharing solves this only
-  for integrations that borrow the same way — remove any *other* Modbus poller
+  for integrations that borrow the same way, so remove any *other* Modbus poller
   for the unit (a script, Node-RED, a second HA) before setting this one up.
+  **A `modbus:` YAML hub does not share** — Home Assistant's YAML Modbus path
+  opens its own connection, so pointing one at this unit gives you two clients
+  and the cross-talk above, even though both are "Home Assistant".
 
 ## Installation
 
@@ -246,7 +249,9 @@ still work as aliases for `show_airflow`/`show_metrics`.
 If you previously integrated the unit with HA's built-in Modbus YAML:
 
 1. **Remove the `modbus:` YAML** (or at least this unit's hub) and restart —
-   the Multi24 does not reliably serve two clients.
+   the Multi24 does not reliably serve two clients, and a YAML hub genuinely is
+   a second client: it opens its own connection rather than sharing the one this
+   integration borrows.
 2. Add this integration.
 3. Old automations keep working if you rename the new entities to your old
    entity ids (Settings → entities → rename), or update the automations to
