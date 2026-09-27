@@ -1,4 +1,4 @@
-# CLAUDE.md — Parmair MAC integration
+# Parmair MAC integration — agent guide (CLAUDE.md, symlinked as AGENTS.md)
 
 ## What this is
 
