@@ -30,10 +30,14 @@ via HACS from `machadolucas/ha-parmair`.
   retry-time measure), and **never** reload the entry from
   `on_connection_lost` — recovery is the next transaction's warm-up.
 - The Multi24 is slow and cannot pipeline: spacing is delegated to
-  `unit.set_message_spacing(INTER_TRANSACTION_DELAY)`, which the library
-  enforces bus-wide by holding a connection lock across each request; our own
-  `asyncio.Lock` remains, and is only about keeping *our* multi-step sequences
-  (warm-up + request + retry) atomic against a concurrent verify-read.
+  `unit.set_message_spacing(INTER_TRANSACTION_DELAY)`. That spacing is **per
+  unit id**, not bus-wide (tmodbus: `pacer.set_unit_spacing(unit_id, …)`):
+  the pacing lock is taken only for requests whose unit id (or connection) has
+  a spacing set, and the TCP transport pipelines by transaction id. So another
+  consumer borrowing unit id 1 on the same connection is neither spaced nor
+  serialized against our unit id 0. Our own `asyncio.Lock` remains, and is
+  only about keeping *our* multi-step sequences (warm-up + request + retry)
+  atomic against a concurrent verify-read.
 - Reads/writes retry 3× (`RETRY_BACKOFF`). The warm-up read of
   `WARM_UP_ADDRESS` is **lazy**, gated on `unit.connected` — that also catches
   drops we did not cause (a desync the backend handled, another holder's
@@ -41,7 +45,15 @@ via HACS from `machadolucas/ha-parmair`.
   discards the link (the last one included, so a caller that gives up doesn't
   hand the next one a link we know is broken); an error *response* does not,
   since the controller demonstrably answered — see
-  `ParmairConnectionError.device_answered`.
+  `ParmairConnectionError.device_answered`. Exception codes 1–3 (illegal
+  function/address/value) are `deterministic` and not retried at all. A
+  released client (`close()` ran) fails fast with `ParmairClientReleasedError`
+  — no retries and never a disconnect of a link it no longer holds.
+- When a transaction's last attempt failed at the warm-up (the link could not
+  be established), the error carries `link_unreachable=True`; the coordinator
+  then marks the rest of the cycle's blocks failed without I/O (previous
+  values kept, `block_failures` counted). Any other block failure keeps the
+  per-block tolerance.
 - Each request is bounded by `REQUEST_TIMEOUT` because core fixes the shared
   connection's own timeout at 10 s, longer than a whole poll cycle, and
   consumers cannot override it.
@@ -88,13 +100,29 @@ Rules:
   register, decide its gate; probe-based gates read the sentinel at config
   time.
 - Cooking detection is **event-driven**, not polled: the coordinator feeds
-  external sensor state-change events into one long-lived `CookingDetector`
+  external sensor state-change events — and `EVENT_STATE_REPORTED` for
+  unchanged re-reports, or a steady sensor looks silent and trips
+  `GAP_RESET_S` — into one long-lived `CookingDetector`
   and notifies its entities via the `SIGNAL_COOKING_UPDATE` dispatcher —
   never `async_set_updated_data` (cooking state lives on coordinator
   attributes, `coordinator.data` stays register-values only). Learned
   baselines persist in `Store` (`.storage/parmair_cooking_<entry_id>`).
   Auto-boost claims ownership only for boosts it started (write succeeds →
-  claim; poll shows boost gone → drop) so manual/CO₂ boosts are respected.
+  claim; poll has shown the boost and then shows it gone → drop) so
+  manual/CO₂ boosts are respected. It never claims over fireplace or manual
+  speed, and a *user* write to `control_state`/`speed_control`/`power_state`
+  drops the claim and any pending restore (the cooking glue's own writes go
+  through `_async_write_pairs(user=False)` so they don't self-invalidate).
+- Writes: `async_write`/`async_write_sequence` hold a coordinator
+  `_write_lock` (sequences are atomic; polls don't take it). Every write and
+  verify-read bumps a sequence counter and stamps its keys; a poll keeps the
+  current value for any key stamped after its block's read began, so an older
+  block read can't undo an optimistic write. A `control_state` write also
+  optimistically patches `boost_active`/`fireplace_active`. Verify-reads batch
+  every pending block (one read each) rather than the last key only.
+- Repair issue ids are per entry (`coordinator.issue_id(base, entry_id)`; the
+  base stays the translation key). `async_remove_entry` deletes them, the
+  cooking `Store`, and — with the last entry — the Lovelace resource.
 
 ## Write semantics (verified on the real unit)
 
@@ -230,11 +258,28 @@ never loaded").
 - Headroom check: 1.53 s against a 10 s scan interval. `INTER_TRANSACTION_DELAY`
   could roughly quintuple before a cycle overran the interval.
 
-## Outage timing (measured live, 2026-09-03, v0.5.0)
+## Outage timing
+
+**Current (unreachable-link fast-fail; predicted, not yet measured live):** the
+first block of a failed cycle still spends its full retry budget (~32 s, see
+below), fails at the warm-up, is flagged `link_unreachable`, and the other 5
+blocks are marked failed without I/O. So a fully-failed cycle takes **~32 s**
+instead of ~189 s, and with the scan interval re-armed after each cycle,
+`ISSUE_CONNECTION_LOST` (still 5 consecutive full failures) should surface
+**~3.5 min** (5 × (32 + 10) s) after the unit goes unreachable instead of
+~16.5 min. `block_failures` still grows by 6 per failed cycle. A cycle
+straddling the drop can now also end up a *full* failure (if the first block to
+hit the dead link finds it unwarmable), which shortens the lag in
+`last_successful_update`. Re-measure with the block below before relying on
+these numbers.
+
+### History: measured live, 2026-09-03, v0.5.0 (before the fast-fail)
 
 Blocking the unit at the network level for 16 min and restoring it confirmed the
 recovery path end to end, and measured something worth knowing before touching
-`REQUEST_TIMEOUT`, `RETRY_BACKOFF` or `CONNECTION_LOST_THRESHOLD`:
+`REQUEST_TIMEOUT`, `RETRY_BACKOFF` or `CONNECTION_LOST_THRESHOLD`. The per-block
+figures still hold; the per-cycle and repair-lag figures are what the fast-fail
+changed:
 
 - **A fully-failed poll cycle takes ~189 s**, not one scan interval. Per block:
   3 attempts × (2 warm-up reads × `REQUEST_TIMEOUT` + `WARM_UP_PAUSE`) plus
@@ -254,7 +299,9 @@ recovery path end to end, and measured something worth knowing before touching
   across an outage, something reintroduced reload-on-drop.
 - Every failed block read fails at `read 1244/1` (the warm-up address), not at
   the block's own address: `_ensure_link()` short-circuits before `op()` is
-  issued onto a link known to be down. That is the expected log signature.
+  issued onto a link known to be down. That is the expected log signature —
+  and exactly what `link_unreachable` now keys the fast-fail on, so expect a
+  single such line per failed cycle rather than six.
 
 ## Shared Modbus connection (shipped in v0.5.0)
 

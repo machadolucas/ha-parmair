@@ -29,7 +29,6 @@ DEFAULT_PORT = 502
 DEFAULT_NAME = "Parmair"
 DEFAULT_SCAN_INTERVAL = 10  # seconds
 DEFAULT_CO2_OFFSET = 0
-UNIT_ID = 0  # the Multi24 answers on unit/slave id 0, not 1
 
 # Summer-auto defaults (SummerAutoParams) — the summer-auto switch/number entities let
 # the user override these; the coordinator falls back to them until then.
@@ -126,13 +125,16 @@ VERIFY_KEY: dict[str, str] = {
     "power_state": "power_state",
 }
 
-# Repairs issue ids
+# Repairs issue bases. Also the translation keys; the issue *ids* are made
+# per entry (coordinator.issue_id) so two units never clear each other's.
 ISSUE_FILTER_CHANGE_DUE = "filter_change_due"
 ISSUE_ACTIVE_ALARM = "active_alarm"
 ISSUE_CONNECTION_LOST = "connection_lost"
 
 # Number of consecutive fully-failed update cycles before the
-# connection_lost repair issue is raised.
+# connection_lost repair issue is raised. With the unreachable-link fast-fail
+# a failed cycle costs one block's retry budget (~32 s) plus the scan interval,
+# so 5 cycles is ~3.5 min at the default 10 s interval (see CLAUDE.md).
 CONNECTION_LOST_THRESHOLD = 5
 
 # Card

@@ -334,9 +334,7 @@ class ParmairNumber(ParmairEntity, NumberEntity):
         return value + self.entity_description.display_offset
 
     async def async_set_native_value(self, value: float) -> None:
-        await self.coordinator.async_write(
-            self._key, value - self.entity_description.display_offset
-        )
+        await self._async_write(self._key, value - self.entity_description.display_offset)
 
 
 class ParmairSummerAutoNumber(ParmairEntity, RestoreNumber):

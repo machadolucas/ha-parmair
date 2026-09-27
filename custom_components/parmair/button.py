@@ -73,4 +73,4 @@ class ParmairButton(ParmairEntity, ButtonEntity):
         super().__init__(coordinator, description.key)
 
     async def async_press(self) -> None:
-        await self.entity_description.press_fn(self.coordinator)
+        await self._async_guard_write(self.entity_description.press_fn(self.coordinator))

@@ -212,6 +212,7 @@ class CookingDetector:
         self._arm_since: datetime | None = None
         self._off_since: datetime | None = None
         self._freeze_until: datetime | None = None
+        self._last_eval: datetime | None = None
 
     # -- properties --------------------------------------------------------- #
 
@@ -252,10 +253,13 @@ class CookingDetector:
 
         ``value=None`` marks the sensor unavailable: it stops contributing
         evidence and is flagged to re-warm-up on its next real sample (the
-        reboot guard). Returns the fusion/state-machine outcome at ``now``.
+        reboot guard). A non-finite value (nan/inf) is treated the same way —
+        folded into the EMA it would poison the baseline for good. Returns the
+        fusion/state-machine outcome at ``now``.
         """
         st = self._state(entity_id)
-        if value is None:
+        self._expire_stale_arming(now)
+        if value is None or not math.isfinite(value):
             # Unavailable: drop the slope window, zero evidence, and require a
             # fresh warm-up when it returns (an unavailable episode is exactly
             # how a sensor reboot presents to HA).
@@ -279,7 +283,25 @@ class CookingDetector:
         silent during an active detection the fused score decays to 0 and the
         normal off-delay path ends the detection.
         """
+        self._expire_stale_arming(now)
         return self._evaluate(now, params)
+
+    def _expire_stale_arming(self, now: datetime) -> None:
+        """Forget a pending onset if nothing was evaluated for longer than STALE_S.
+
+        Arming demands the score hold >= S_on *continuously*, but the state
+        machine only runs when a sample (or a heartbeat tick, which exists only
+        while active) arrives. Across a silence longer than STALE_S every piece
+        of evidence behind the arming has expired — the score would have
+        dropped to 0 had anything looked — so a lone spike, a long gap and a
+        second spike must not add up to an instant ON.
+        """
+        if (
+            self._arm_since is not None
+            and self._last_eval is not None
+            and (now - self._last_eval).total_seconds() > STALE_S
+        ):
+            self._arm_since = None
 
     def _frozen(self, now: datetime) -> bool:
         """Whether baselines are held (active detection or its freeze tail)."""
@@ -401,6 +423,7 @@ class CookingDetector:
             contribution = _clamp((evidence - Z_IGNORE) / (Z_STRONG - Z_IGNORE), 0.0, CONTRIB_CAP)
             score += contribution
         self._score = score
+        self._last_eval = now
 
         transition: bool | None = None
 
@@ -474,17 +497,32 @@ class CookingDetector:
         entries are marked *unverified*: the first live sample either confirms
         them (small z -> skip warm-up) or exposes them as stale (z > gate ->
         fall back to a full warm-up).
+
+        Only sensors this detector was built with are restored: a sensor
+        removed from the options would otherwise be resurrected on every
+        restart and carried forever in snapshots and diagnostics. Malformed or
+        non-finite entries are skipped, since one nan baseline never recovers.
         """
         if not stored:
             return
         for eid, data in (stored.get("sensors") or {}).items():
-            saved_at = data.get("saved_at")
-            if saved_at is None or now.timestamp() - saved_at > RESTORE_MAX_AGE_S:
+            st = self._sensors.get(eid)
+            if st is None:
                 continue
-            st = self._state(eid)
-            st.mu = float(data["mu"])
-            st.dev = float(data["dev"])
-            st.n = int(data.get("n", WARMUP_SAMPLES))
+            try:
+                saved_at = float(data["saved_at"])
+                mu = float(data["mu"])
+                dev = float(data["dev"])
+                n = int(data.get("n", WARMUP_SAMPLES))
+            except KeyError, TypeError, ValueError, OverflowError:
+                continue
+            if not all(math.isfinite(v) for v in (saved_at, mu, dev)) or dev < 0:
+                continue
+            if now.timestamp() - saved_at > RESTORE_MAX_AGE_S:
+                continue
+            st.mu = mu
+            st.dev = dev
+            st.n = n
             st.restored_unverified = True
             st.needs_rewarm = False
             st.last_t = None

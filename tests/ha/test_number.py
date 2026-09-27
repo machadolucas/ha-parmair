@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
 from custom_components.parmair.const import DOMAIN
@@ -97,3 +99,15 @@ async def test_summer_auto_numbers_defaults_and_set(
     await _set_value(hass, on_temp_entity, 24)
 
     assert coordinator.summer_auto_params.on_temp_c == 24.0
+
+
+async def test_write_failure_raises_translated_error(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    entry, fake_client = await async_setup_integration(rexo120_bank)
+    fake_client.fail_writes = True
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await _set_value(hass, _entity_id(hass, entry.entry_id, "home_speed"), 4)
+
+    assert exc_info.value.translation_key == "write_failed"

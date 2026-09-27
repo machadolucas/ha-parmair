@@ -17,6 +17,7 @@ persistence gate.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from typing import Any
 from unittest.mock import patch
@@ -492,3 +493,152 @@ async def test_options_reload_rewires(
         await _warmup(hass, freezer, new_sensor)
         await _feed(hass, freezer, new_sensor, ONSET)
         assert new_coordinator.cooking_active is True
+
+
+# --------------------------------------------------------------------------- #
+# Ownership vs. the user's own mode choices
+# --------------------------------------------------------------------------- #
+
+
+async def test_user_mode_write_cancels_a_pending_cooking_restore(
+    hass: HomeAssistant,
+    rexo120_bank: dict[int, int],
+    rexo120_capabilities_dict: dict[str, Any],
+    freezer,
+) -> None:
+    """Regression: a pending restore overwrote the user's fireplace selection."""
+    entry, fake = await _setup_cooking(hass, rexo120_bank, rexo120_capabilities_dict, [VOC])
+    coordinator = entry.runtime_data
+    await _turn_on_auto_boost(hass, entry.entry_id)
+    await _set_number(hass, entry.entry_id, "cooking_off_delay", 1)
+    await _set_number(hass, entry.entry_id, "cooking_min_boost_minutes", 30)
+
+    await _warmup(hass, freezer)
+    await _feed(hass, freezer, VOC, ONSET)
+    assert coordinator._cooking_boost_owner is True
+    fake.bank[1201] = 1
+    await coordinator.async_refresh()
+
+    # Detection ends; the restore waits out the 30 min minimum boost.
+    await _feed(hass, freezer, VOC, [80.0] * 8, step_s=10.0)
+    assert coordinator._cooking_restore_cancel is not None
+
+    await coordinator.async_write_sequence([("speed_control", 0), ("control_state", 4)])
+    assert coordinator._cooking_boost_owner is False
+    assert coordinator._cooking_restore_cancel is None
+
+    fake.writes.clear()
+    await _fire_timers(hass, seconds=31 * 60)
+    assert (1185, 2) not in fake.writes  # the fireplace choice stands
+
+
+async def test_restore_queued_behind_the_lock_yields_to_a_retrigger(
+    hass: HomeAssistant,
+    rexo120_bank: dict[int, int],
+    rexo120_capabilities_dict: dict[str, Any],
+    freezer,
+) -> None:
+    """Regression: a restore already past its timer ended a boost cooking re-claimed.
+
+    Once the restore callback has started it can no longer be cancelled by
+    the re-trigger, so it must notice the detection is live again itself.
+    """
+    entry, fake = await _setup_cooking(hass, rexo120_bank, rexo120_capabilities_dict, [VOC])
+    coordinator = entry.runtime_data
+    await _turn_on_auto_boost(hass, entry.entry_id)
+    await _set_number(hass, entry.entry_id, "cooking_off_delay", 1)
+
+    await _warmup(hass, freezer)
+    await _feed(hass, freezer, VOC, ONSET)
+    assert coordinator._cooking_boost_owner is True
+    await coordinator.async_refresh()  # fake reflects the boost: boost_active 1
+    await _feed(hass, freezer, VOC, [80.0] * 8, step_s=10.0)
+    assert coordinator.cooking_active is False
+    assert coordinator._cooking_restore_cancel is not None
+
+    # The restore fires but queues behind a write holding the lock ...
+    coordinator._cooking_restore_cancel()
+    async with coordinator._write_lock:
+        restore = asyncio.create_task(coordinator._async_cooking_restore(dt_util.utcnow()))
+        await asyncio.sleep(0)
+        # ... while cooking re-triggers.
+        await _feed(hass, freezer, VOC, ONSET)
+        assert coordinator.cooking_active is True
+        fake.writes.clear()
+    await restore
+    await hass.async_block_till_done()
+
+    assert (1185, 2) not in fake.writes and (1185, 1) not in fake.writes
+    assert coordinator._cooking_boost_owner is True
+
+
+async def test_cooking_own_writes_do_not_drop_its_claim(
+    hass: HomeAssistant,
+    rexo120_bank: dict[int, int],
+    rexo120_capabilities_dict: dict[str, Any],
+    freezer,
+) -> None:
+    """The boost start writes speed_control + control_state itself: not a takeover."""
+    entry, _fake = await _setup_cooking(hass, rexo120_bank, rexo120_capabilities_dict, [VOC])
+    await _turn_on_auto_boost(hass, entry.entry_id)
+    await _warmup(hass, freezer)
+    await _feed(hass, freezer, VOC, ONSET)
+    assert entry.runtime_data._cooking_boost_owner is True
+
+
+async def test_auto_boost_leaves_fireplace_and_manual_speed_alone(
+    hass: HomeAssistant,
+    rexo120_bank: dict[int, int],
+    rexo120_capabilities_dict: dict[str, Any],
+    freezer,
+) -> None:
+    # fireplace_active; control_state manual; a manual speed written but not
+    # yet verified (speed_control already optimistic, control_state still home).
+    for register, value in ((1203, 1), (1185, 9), (1187, 4)):
+        bank = dict(rexo120_bank)
+        bank[register] = value
+        entry, fake = await _setup_cooking(hass, bank, rexo120_capabilities_dict, [VOC])
+        await _turn_on_auto_boost(hass, entry.entry_id)
+        await _warmup(hass, freezer)
+        await _feed(hass, freezer, VOC, ONSET)
+
+        assert entry.runtime_data.cooking_active is True
+        assert [w for w in fake.writes if w[0] in (1185, 1187)] == [], register
+        assert entry.runtime_data._cooking_boost_owner is False
+        await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+
+
+# --------------------------------------------------------------------------- #
+# Unchanged re-reports (EVENT_STATE_REPORTED)
+# --------------------------------------------------------------------------- #
+
+
+async def test_steady_sensor_reports_keep_the_baseline_warm(
+    hass: HomeAssistant,
+    rexo120_bank: dict[int, int],
+    rexo120_capabilities_dict: dict[str, Any],
+    freezer,
+) -> None:
+    """Regression: a steady integer humidity sensor only fires state_reported.
+
+    Subscribed to state_changed alone, the detector saw nothing for 6 min, so
+    the ramp's first sample restarted warm-up and the cook went undetected.
+    """
+    hum = "sensor.test_kitchen_humidity"
+    attrs = {"unit_of_measurement": "%", "device_class": "humidity"}
+    hass.states.async_set(hum, "45", attrs)
+    entry, _fake = await _setup_cooking(hass, rexo120_bank, rexo120_capabilities_dict, [hum])
+    coordinator = entry.runtime_data
+
+    for _ in range(36):  # 6 min of an unchanged value, re-reported every 10 s
+        freezer.tick(timedelta(seconds=10))
+        hass.states.async_set(hum, "45", attrs)
+        await hass.async_block_till_done()
+
+    for value in (46, 48, 51, 54, 57, 60):
+        freezer.tick(timedelta(seconds=2))
+        hass.states.async_set(hum, str(value), attrs)
+        await hass.async_block_till_done()
+
+    assert coordinator.cooking_active is True

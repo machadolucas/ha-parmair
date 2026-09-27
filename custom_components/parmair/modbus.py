@@ -13,9 +13,13 @@ borrow one. What lives here is the Multi24-specific policy that shared
 connection does not provide:
 
 * The unit cannot pipeline, so requests are spaced at least
-  :data:`INTER_TRANSACTION_DELAY` apart (``set_message_spacing``, which the
-  library enforces connection-wide), and an :class:`asyncio.Lock` keeps our own
-  multi-step sequences atomic against a concurrent verify-read.
+  :data:`INTER_TRANSACTION_DELAY` apart (``set_message_spacing``), and an
+  :class:`asyncio.Lock` keeps our own multi-step sequences atomic against a
+  concurrent verify-read. The spacing is *per unit id*, not connection-wide:
+  the library paces (and serializes, under its pacing lock) only requests for a
+  unit id that has a spacing set, so another consumer borrowing unit id 1 on
+  the same connection is neither spaced nor serialized against our unit id 0 —
+  the TCP transport pipelines by transaction id underneath.
 * The controller's first reply after a fresh connect is flaky, so a
   tolerated-failure warm-up read settles the link whenever it is down.
 * Another client's traffic on the same unit can desync the link, so every
@@ -32,6 +36,9 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 from modbus_connection import (
+    IllegalDataAddressError,
+    IllegalDataValueError,
+    IllegalFunctionError,
     ModbusError,
     ModbusExceptionError,
     ModbusTcpParams,
@@ -62,6 +69,11 @@ WARM_UP_PAUSE = 0.3  # seconds, between the tolerated failure and the retry
 RETRY_BACKOFF = (0.5, 1.0)
 MAX_ATTEMPTS = 1 + len(RETRY_BACKOFF)
 
+# Exception responses that say "this request is wrong", not "the device is
+# momentarily unable": the same request gets the same answer, so retrying only
+# burns three paced round trips (and a verify-read's worth of latency) for it.
+_DETERMINISTIC_REJECTIONS = (IllegalFunctionError, IllegalDataAddressError, IllegalDataValueError)
+
 
 class ParmairConnectionError(Exception):
     """Any Modbus-transport failure: timeout, link loss, or error response.
@@ -70,11 +82,37 @@ class ParmairConnectionError(Exception):
     exception response. The link itself is healthy in that case, so the retry
     must not tear it down — it is shared, and dropping it would punish any
     other integration on the same bus for what is our own bad request.
+
+    ``deterministic`` marks an exception response (codes 1–3) that retrying
+    cannot change, so :meth:`ParmairModbusClient._retry` re-raises it at once.
+
+    ``link_unreachable`` is set on the error a transaction finally gives up
+    with when its last attempt could not even warm the link up — the unit is
+    not answering at all, as opposed to this one request failing. The
+    coordinator uses it to skip the rest of a poll cycle instead of paying the
+    full retry budget once per block against a unit that is gone.
     """
 
-    def __init__(self, message: str, *, device_answered: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        device_answered: bool = False,
+        deterministic: bool = False,
+    ) -> None:
         super().__init__(message)
         self.device_answered = device_answered
+        self.deterministic = deterministic
+        self.link_unreachable = False
+
+
+class ParmairClientReleasedError(ParmairConnectionError):
+    """I/O was attempted on a client whose hold has been released.
+
+    Distinct so the retry loop can refuse it outright: retrying is pointless,
+    and the retry-time :meth:`~ParmairModbusClient._drop_link` would otherwise
+    disconnect a *shared* connection we no longer have any claim on.
+    """
 
 
 def tcp_params(host: str, port: int) -> ModbusTcpParams:
@@ -122,6 +160,7 @@ class ParmairModbusClient:
         succeed against an unreachable unit and only fail on the first real
         read. Callers holding the lock use :meth:`_ensure_link` instead.
         """
+        self._check_open("connect")
         async with self._lock:
             await self._warm_up()
 
@@ -131,7 +170,8 @@ class ParmairModbusClient:
         Never disconnects. The connection is shared and refcounted by the
         ``modbus`` integration, which closes it once the last config entry
         holding a unit on it unloads; that release runs from
-        ``entry.async_on_unload`` after this.
+        ``entry.async_on_unload`` after this. Idempotent, since both a failed
+        setup and an unload may reach it.
         """
         self._closed = True
         if self._unsub_lost is not None:
@@ -149,11 +189,17 @@ class ParmairModbusClient:
         self.link_drops += 1
         _LOGGER.debug("Parmair Modbus link dropped (%d so far)", self.link_drops)
 
+    def _check_open(self, what: str) -> None:
+        if self._closed:
+            raise ParmairClientReleasedError(f"{what} attempted after release")
+
     async def read_block(self, address: int, count: int) -> list[int]:
+        self._check_open(f"read {address}/{count}")
         async with self._lock:
             return await self._retry(lambda: self._read_once(address, count))
 
     async def write_register(self, address: int, value: int) -> None:
+        self._check_open(f"write {address}={value}")
         async with self._lock:
             await self._retry(lambda: self._write_once(address, value))
 
@@ -169,14 +215,26 @@ class ParmairModbusClient:
         the controller demonstrably answered, so the link is kept.
 
         A link that cannot even be warmed up short-circuits the attempt, so
-        ``op`` is never issued onto one known to be down.
+        ``op`` is never issued onto one known to be down; when that is how the
+        last attempt failed, the error is flagged ``link_unreachable``.
+
+        Two failures are not retried at all: a deterministic rejection (the
+        same request would be rejected again) and a release that happened
+        while we waited — the link is then no longer ours to drop.
         """
         last_err: ParmairConnectionError | None = None
         for attempt in range(MAX_ATTEMPTS):
+            warming = True
             try:
                 await self._ensure_link()
+                warming = False
                 return await op()
+            except ParmairClientReleasedError:
+                raise
             except ParmairConnectionError as err:
+                if err.deterministic:
+                    raise
+                err.link_unreachable = warming
                 last_err = err
                 await self._drop_link(err)
                 if attempt == MAX_ATTEMPTS - 1:
@@ -206,6 +264,8 @@ class ParmairModbusClient:
         """
         try:
             await self._read_once(WARM_UP_ADDRESS, 1)
+        except ParmairClientReleasedError:
+            raise
         except ParmairConnectionError as err:
             _LOGGER.debug("Parmair warm-up read failed once (tolerated): %s", err)
             await asyncio.sleep(WARM_UP_PAUSE)
@@ -213,7 +273,7 @@ class ParmairModbusClient:
 
     async def _drop_link(self, err: ParmairConnectionError) -> None:
         """Discard the link so the next attempt dials and warms a fresh one."""
-        if err.device_answered:
+        if err.device_answered or self._closed:
             return
         try:
             await self._unit.disconnect()
@@ -240,11 +300,14 @@ class ParmairModbusClient:
         ``op`` is a zero-argument callable rather than a coroutine so the
         released-client guard can refuse without leaving one un-awaited.
         """
-        if self._closed:
-            raise ParmairConnectionError(f"{what} attempted after release")
+        self._check_open(what)
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT):
                 return await op()
+        except _DETERMINISTIC_REJECTIONS as err:
+            raise ParmairConnectionError(
+                f"{what} rejected: {err}", device_answered=True, deterministic=True
+            ) from err
         except ModbusExceptionError as err:
             raise ParmairConnectionError(f"{what} rejected: {err}", device_answered=True) from err
         except (ModbusError, TimeoutError, OSError) as err:

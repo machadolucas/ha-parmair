@@ -24,6 +24,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from .const import (
     CONTROL_STATE_BOOST,
     CONTROL_STATE_FIREPLACE,
+    SPEED_CONTROL_AUTO,
 )
 from .coordinator import (
     ParmairConfigEntry,
@@ -66,8 +67,17 @@ def _boost_is_on(data: ParmairData) -> bool | None:
     return None if value is None else bool(value)
 
 
+async def _enter_preset(coordinator: ParmairCoordinator, control_state: int) -> None:
+    # Same sequence as the fan presets: from manual speed (control_state 9) a
+    # bare control_state write isn't guaranteed to take, so release manual
+    # speed control first.
+    await coordinator.async_write_sequence(
+        [("speed_control", SPEED_CONTROL_AUTO), ("control_state", control_state)]
+    )
+
+
 async def _boost_turn_on(coordinator: ParmairCoordinator, data: ParmairData) -> None:
-    await coordinator.async_write("control_state", CONTROL_STATE_BOOST)
+    await _enter_preset(coordinator, CONTROL_STATE_BOOST)
 
 
 async def _boost_turn_off(coordinator: ParmairCoordinator, data: ParmairData) -> None:
@@ -80,7 +90,7 @@ def _fireplace_is_on(data: ParmairData) -> bool | None:
 
 
 async def _fireplace_turn_on(coordinator: ParmairCoordinator, data: ParmairData) -> None:
-    await coordinator.async_write("control_state", CONTROL_STATE_FIREPLACE)
+    await _enter_preset(coordinator, CONTROL_STATE_FIREPLACE)
 
 
 async def _fireplace_turn_off(coordinator: ParmairCoordinator, data: ParmairData) -> None:
@@ -210,10 +220,14 @@ class ParmairSwitch(ParmairEntity, SwitchEntity):
         return self.entity_description.is_on_fn(data)
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self.entity_description.turn_on_fn(self.coordinator, self.coordinator.data or {})
+        await self._async_guard_write(
+            self.entity_description.turn_on_fn(self.coordinator, self.coordinator.data or {})
+        )
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self.entity_description.turn_off_fn(self.coordinator, self.coordinator.data or {})
+        await self._async_guard_write(
+            self.entity_description.turn_off_fn(self.coordinator, self.coordinator.data or {})
+        )
 
 
 class ParmairSummerAutoSwitch(ParmairEntity, RestoreEntity, SwitchEntity):

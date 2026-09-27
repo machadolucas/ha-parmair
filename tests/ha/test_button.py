@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
@@ -47,3 +49,16 @@ async def test_filter_changed_press_writes_dates_then_state(
     ]
     for write in expected:
         assert write in fake_client.writes
+
+
+async def test_write_failure_raises_translated_error(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    entry, fake_client = await async_setup_integration(rexo120_bank)
+    fake_client.fail_writes = True
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await _press(hass, _entity_id(hass, entry.entry_id, "filter_changed"))
+
+    assert exc_info.value.translation_key == "write_failed"
+    assert fake_client.writes == []

@@ -118,4 +118,4 @@ class ParmairClimate(ParmairEntity, ClimateEntity):
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             return
-        await self.coordinator.async_write(self._key, temperature)
+        await self._async_write(self._key, temperature)

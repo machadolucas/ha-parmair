@@ -188,6 +188,18 @@ def rexo120_capabilities_dict(rexo120_bank: dict[int, int]) -> dict[str, Any]:
     return parse_capabilities(static_values, probe_values).as_dict()
 
 
+# On-wire addresses (spec register + 1000) the write side effects touch.
+_ADDR_HOME_SPEED = 1104
+_ADDR_AWAY_SPEED = 1105
+_ADDR_CONTROL_STATE = 1185
+_ADDR_FAN_SPEED_STATE = 1186
+_ADDR_SPEED_CONTROL = 1187
+_ADDR_HOME_STATE = 1200
+_ADDR_BOOST_ACTIVE = 1201
+_ADDR_FIREPLACE_ACTIVE = 1203
+_ADDR_POWER_STATE = 1208
+
+
 class FakeModbusClient:
     """In-memory stand-in for :class:`~custom_components.parmair.modbus.ParmairModbusClient`.
 
@@ -196,7 +208,9 @@ class FakeModbusClient:
     ``link_drops``) so ``__init__.py``/``coordinator.py`` never notice they're
     not talking to a real Modbus connection. ``bank`` is keyed by on-wire
     address; writes are applied back into it so a subsequent verify-read
-    observes them, just like the real controller.
+    observes them, just like the real controller — including the other
+    registers the unit updates in response (see :meth:`_apply_side_effects`).
+    ``fail_writes`` makes every write raise, as a dropped link would.
 
     ``close`` clears ``connected`` here purely so the double stays
     self-consistent; the real client leaves the shared link alone (it only
@@ -209,6 +223,7 @@ class FakeModbusClient:
         self.fail_reads_at: set[int] = set()
         self.fail_all = False
         self.fail_connect = False
+        self.fail_writes = False
         self.connect_calls = 0
         self.read_calls = 0
         self.close_calls = 0
@@ -238,8 +253,49 @@ class FakeModbusClient:
         return [self.bank.get(a, 0) for a in range(address, address + count)]
 
     async def write_register(self, address: int, value: int) -> None:
+        if self.fail_writes:
+            raise ParmairConnectionError(f"simulated write failure at {address}")
         self.writes.append((address, value))
         self.bank[address] = value
+        self._apply_side_effects(address, value)
+
+    def _apply_side_effects(self, address: int, value: int) -> None:
+        """Mirror how the real unit reacts to a mode write (CLAUDE.md "Write semantics").
+
+        Without this, a write only ever changed its own register, so a
+        verify-read could never contradict an optimistic update and bugs in
+        write *sequencing* stayed invisible. The home/away fan speeds follow
+        the live snapshot (home_speed raw 2 -> fan_speed_state 3 at home).
+        Whether a manual speed also clears the boost/fireplace flags is
+        inferred from control_state flipping to 9, not observed directly.
+        """
+        bank = self.bank
+        if address == _ADDR_CONTROL_STATE:
+            bank[_ADDR_BOOST_ACTIVE] = int(value == 3)
+            bank[_ADDR_FIREPLACE_ACTIVE] = int(value == 4)
+            if value in (1, 2):
+                speed_address = _ADDR_HOME_SPEED if value == 2 else _ADDR_AWAY_SPEED
+                bank[_ADDR_FAN_SPEED_STATE] = bank.get(speed_address, 0) + 1
+        elif address == _ADDR_SPEED_CONTROL:
+            if 2 <= value <= 6:  # manual speed 1-5
+                bank[_ADDR_FAN_SPEED_STATE] = value - 1
+                bank[_ADDR_BOOST_ACTIVE] = 0
+                bank[_ADDR_FIREPLACE_ACTIVE] = 0
+                bank[_ADDR_CONTROL_STATE] = 9
+            elif value == 1:  # stop
+                bank[_ADDR_FAN_SPEED_STATE] = 0
+            elif value == 0 and bank.get(_ADDR_CONTROL_STATE) == 9:
+                # Leaving manual falls back to the home/away the unit is in.
+                home = bank.get(_ADDR_HOME_STATE) == 1
+                bank[_ADDR_CONTROL_STATE] = 2 if home else 1
+                self._apply_side_effects(_ADDR_CONTROL_STATE, bank[_ADDR_CONTROL_STATE])
+        elif address == _ADDR_POWER_STATE:
+            # 2 = start -> 3 (on), 1 = stop -> 0 (off); the transitional
+            # values are collapsed so a verify-read sees the settled state.
+            if value == 2:
+                bank[address] = 3
+            elif value == 1:
+                bank[address] = 0
 
 
 @pytest.fixture

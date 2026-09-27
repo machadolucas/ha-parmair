@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
 from homeassistant.components.climate import DATA_COMPONENT
 from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
 from custom_components.parmair.const import DOMAIN
@@ -85,3 +87,23 @@ async def test_hvac_action_from_temperature_mode(
 
     state = hass.states.get(entity_id)
     assert state.attributes["hvac_action"] == "heating"
+
+
+async def test_write_failure_raises_translated_error(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    entry, fake_client = await async_setup_integration(rexo120_bank)
+    fake_client.fail_writes = True
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await hass.services.async_call(
+            "climate",
+            "set_temperature",
+            {
+                "entity_id": _entity_id(hass, entry.entry_id, "supply_temperature_target"),
+                "temperature": 19.5,
+            },
+            blocking=True,
+        )
+
+    assert exc_info.value.translation_key == "write_failed"

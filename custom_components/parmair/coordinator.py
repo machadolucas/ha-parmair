@@ -9,29 +9,42 @@ them, and merges in the one-shot static-register snapshot. A block read is
 allowed to fail on its own — the previous cycle's values for its keys are kept
 — and only a fully-failed cycle (every block failed) raises ``UpdateFailed``;
 this matches the controller's own flakiness (see ``modbus.py``) without
-flapping every entity to unavailable over one bad block.
+flapping every entity to unavailable over one bad block. The exception is a
+block that fails because the link could not even be warmed up
+(``ParmairConnectionError.link_unreachable``): the unit is gone, so the rest of
+the cycle is marked failed without spending a full retry budget on each block.
 
 Writes are optimistic (the target value is pushed immediately via
 ``async_set_updated_data``) and followed by a delayed read-back of the block
 that reflects the write's effect (``const.VERIFY_KEY``), since some settings
-only take effect a moment after being written.
+only take effect a moment after being written. Write sequences are atomic
+against each other (``_write_lock``; polls don't take it), and a sequence
+counter stamps every key a write or verify-read sets, so a poll block that was
+read *before* that landed cannot overwrite the fresher value at the end of the
+cycle.
 
 Also owns the summer-mode auto-toggle (:mod:`summer_auto`): the coordinator
 holds the enable flag and thresholds (mutable — the summer-auto switch/number entities
-drive them) and evaluates them once per cycle, firing a fire-and-forget write
+drive them) and evaluates them once per cycle, firing a background write
 when the dwell-gated logic requests a change.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from functools import partial
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.const import (
+    ATTR_UNIT_OF_MEASUREMENT,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    UnitOfTemperature,
+)
+from homeassistant.core import Event, EventStateReportedData, HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -39,11 +52,13 @@ from homeassistant.helpers.event import (
     EventStateChangedData,
     async_call_later,
     async_track_state_change_event,
+    async_track_state_report_event,
     async_track_time_interval,
 )
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_conversion import TemperatureConverter
 
 from .capabilities import Capabilities
 from .const import (
@@ -53,7 +68,9 @@ from .const import (
     CONNECTION_LOST_THRESHOLD,
     CONTROL_STATE_AWAY,
     CONTROL_STATE_BOOST,
+    CONTROL_STATE_FIREPLACE,
     CONTROL_STATE_HOME,
+    CONTROL_STATE_MANUAL,
     COOKING_HEARTBEAT_S,
     COOKING_SAVE_INTERVAL_S,
     COOKING_STORAGE_KEY,
@@ -100,10 +117,44 @@ VERIFY_DELAY = 1.0
 # guard — same interpretation the fan platform uses (2 = turning on, 3 = on).
 _POWER_ON_STATES = (POWER_STATE_TURNING_ON, POWER_STATE_ON)
 
+# A user write to any of these changes the unit's mode, which ends any claim
+# the cooking auto-boost holds: its pending restore would otherwise overwrite
+# the user's choice (e.g. a fireplace selection) when it fires.
+_MODE_KEYS = frozenset({"control_state", "speed_control", "power_state"})
+
+# What the unit derives into boost_active/fireplace_active from a
+# control_state write. Patched in optimistically so the boost/fireplace
+# switches don't bounce back to off until the verify-read lands; the
+# verify-read then replaces the guess with the truth.
+_CONTROL_STATE_DERIVED: dict[int, dict[str, int]] = {
+    CONTROL_STATE_AWAY: {"boost_active": 0, "fireplace_active": 0},
+    CONTROL_STATE_HOME: {"boost_active": 0, "fireplace_active": 0},
+    CONTROL_STATE_BOOST: {"boost_active": 1, "fireplace_active": 0},
+    CONTROL_STATE_FIREPLACE: {"boost_active": 0, "fireplace_active": 1},
+}
+
+_ISSUE_BASES = (ISSUE_FILTER_CHANGE_DUE, ISSUE_ACTIVE_ALARM, ISSUE_CONNECTION_LOST)
+
 
 def restore_control_state(data: ParmairData) -> int:
     """The control-state value that returns the unit to its prior home/away mode."""
     return CONTROL_STATE_HOME if data.get("home_state") == 1 else CONTROL_STATE_AWAY
+
+
+def issue_id(base: str, entry_id: str) -> str:
+    """This entry's id for one repair issue (``base`` is also its translation key).
+
+    Per entry, so with two units one entry's poll never deletes the issue the
+    other just raised.
+    """
+    return f"{base}_{entry_id}"
+
+
+@callback
+def async_delete_issues(hass: HomeAssistant, entry_id: str) -> None:
+    """Delete every repair issue this entry may have raised."""
+    for base in _ISSUE_BASES:
+        ir.async_delete_issue(hass, DOMAIN, issue_id(base, entry_id))
 
 
 class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
@@ -138,6 +189,21 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         self.last_successful_update: datetime | None = None
 
         self._verify_cancel: Callable[[], None] | None = None
+        # Blocks to re-read when the verify timer fires, by address: a second
+        # write before it fires adds its block instead of replacing the first.
+        self._pending_verify: dict[int, ReadBlock] = {}
+
+        # Poll/write race guard: every write or verify-read bumps _seq and
+        # stamps the keys it set; a poll keeps the current value for any key
+        # stamped after its block's read began (see _async_update_data).
+        self._seq = 0
+        self._key_seq: dict[str, int] = {}
+        # Makes a multi-register write sequence atomic against another one
+        # (e.g. a cooking restore landing between a user's speed_control and
+        # control_state writes). Polls don't take it.
+        self._write_lock = asyncio.Lock()
+        # Set first thing in async_shutdown: no new timers, tasks or writes.
+        self._shutting_down = False
 
         # Summer-auto: the switch/number entities drive these two attributes; the
         # feature simply stays disabled.
@@ -164,6 +230,12 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         self.cooking_detector: CookingDetector | None = None
         self._cooking_boost_owner: bool = False
         self._cooking_boost_started: datetime | None = None
+        # Whether a poll has shown the claimed boost as active yet: until then
+        # a boost_active of 0 may just be a read that predates our write.
+        self._cooking_boost_confirmed: bool = False
+        # Bumped whenever the claim is dropped or a user takes the mode over,
+        # so a boost start that was already queued can tell it lost the race.
+        self._cooking_epoch = 0
         self._cooking_restore_cancel: Callable[[], None] | None = None
         self._cooking_heartbeat_cancel: Callable[[], None] | None = None
         self._cooking_store: Store | None = None
@@ -218,6 +290,11 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         """
         await self.client.connect()
 
+        # Issue ids used to be global (shared by every entry); a leftover from
+        # before the per-entry ids would otherwise never be cleared.
+        for base in _ISSUE_BASES:
+            ir.async_delete_issue(self.hass, DOMAIN, base)
+
         static_keys = [key for key, definition in self._map.registers.items() if definition.static]
         static_data: ParmairData = {}
         for block in build_read_plan(self._map, static_keys):
@@ -255,22 +332,40 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         return None
 
     async def _async_update_data(self) -> ParmairData:
+        poll_started = self._seq
         data: ParmairData = dict(self.data) if self.data is not None else {}
         data.update(self._static_data)
 
+        # seq at the moment each successfully read key's block read began.
+        read_at: dict[str, int] = {}
+        failed_keys: set[str] = set()
         failed_blocks = 0
+        unreachable = False
         for block in self._read_plan:
+            if unreachable:
+                # The unit did not answer even a warm-up: every remaining
+                # block would burn the same ~32 s retry budget to learn the
+                # same thing, so count them failed without any I/O.
+                failed_blocks += 1
+                self._fail_block(block, data, failed_keys)
+                continue
+            started = self._seq
             try:
                 raw = await self.client.read_block(block.address, block.count)
             except ParmairConnectionError as err:
                 failed_blocks += 1
-                self.block_failures += 1
+                self._fail_block(block, data, failed_keys)
                 _LOGGER.debug("Parmair block %s/%s failed: %s", block.address, block.count, err)
-                # Keep whatever we had (None on a first-cycle failure).
-                for key in block.keys:
-                    data.setdefault(key, None)
+                if err.link_unreachable:
+                    unreachable = True
+                    _LOGGER.debug("Parmair unit unreachable; skipping the rest of this cycle")
                 continue
-            data.update(self._decode_block(block, raw))
+            decoded = self._decode_block(block, raw)
+            data.update(decoded)
+            for key in decoded:
+                read_at[key] = started
+
+        self._keep_fresher_values(data, read_at, poll_started)
 
         if self._read_plan and failed_blocks == len(self._read_plan):
             self.consecutive_full_failures += 1
@@ -280,52 +375,79 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         self.consecutive_full_failures = 0
         self.last_successful_update = dt_util.utcnow()
         self._update_repairs(data)
-        self._evaluate_summer_auto(data)
         self._reconcile_cooking_boost(data)
+        self._evaluate_summer_auto(data, failed_keys)
+        # Again: the summer-auto write above is started eagerly and may already
+        # have pushed its optimistic value, which this cycle must not undo.
+        self._keep_fresher_values(data, read_at, poll_started)
         return data
+
+    def _fail_block(self, block: ReadBlock, data: ParmairData, failed_keys: set[str]) -> None:
+        """Account one failed block: keep what we had (None on a first-cycle failure)."""
+        self.block_failures += 1
+        for key in block.keys:
+            data.setdefault(key, None)
+        failed_keys.update(block.keys)
+
+    def _keep_fresher_values(
+        self, data: ParmairData, read_at: dict[str, int], poll_started: int
+    ) -> None:
+        """Undo the poll's overwrite of anything a write/verify set after it read.
+
+        Blocks are read with the client lock released in between, so a write's
+        optimistic value (or a verify-read) can land mid-cycle; the block read
+        that began before it carries the older value. A key not read this
+        cycle carries the value copied at poll start, so it compares against
+        that instead.
+        """
+        current = self.data or {}
+        for key, stamped in self._key_seq.items():
+            if stamped > read_at.get(key, poll_started) and key in current:
+                data[key] = current[key]
 
     # ── Repairs ──────────────────────────────────────────────────────────
 
     def _update_repairs(self, data: ParmairData) -> None:
         """Raise/clear the three coordinator-owned repair issues."""
+        entry_id = self.config_entry.entry_id
         if data.get("filter_state") == 0 or data.get("alarm_state") == 2:
             ir.async_create_issue(
                 self.hass,
                 DOMAIN,
-                ISSUE_FILTER_CHANGE_DUE,
+                issue_id(ISSUE_FILTER_CHANGE_DUE, entry_id),
                 is_fixable=False,
                 severity=ir.IssueSeverity.WARNING,
                 translation_key="filter_change_due",
                 translation_placeholders={"next_change": self._next_filter_change(data)},
             )
         else:
-            ir.async_delete_issue(self.hass, DOMAIN, ISSUE_FILTER_CHANGE_DUE)
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id(ISSUE_FILTER_CHANGE_DUE, entry_id))
 
         if data.get("summary_alarm") == 1:
             count = data.get("active_alarm_count")
             ir.async_create_issue(
                 self.hass,
                 DOMAIN,
-                ISSUE_ACTIVE_ALARM,
+                issue_id(ISSUE_ACTIVE_ALARM, entry_id),
                 is_fixable=False,
                 severity=ir.IssueSeverity.WARNING,
                 translation_key="active_alarm",
                 translation_placeholders={"count": str(count) if count is not None else "?"},
             )
         else:
-            ir.async_delete_issue(self.hass, DOMAIN, ISSUE_ACTIVE_ALARM)
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id(ISSUE_ACTIVE_ALARM, entry_id))
 
         if self.consecutive_full_failures >= CONNECTION_LOST_THRESHOLD:
             ir.async_create_issue(
                 self.hass,
                 DOMAIN,
-                ISSUE_CONNECTION_LOST,
+                issue_id(ISSUE_CONNECTION_LOST, entry_id),
                 is_fixable=False,
                 severity=ir.IssueSeverity.WARNING,
                 translation_key="connection_lost",
             )
         else:
-            ir.async_delete_issue(self.hass, DOMAIN, ISSUE_CONNECTION_LOST)
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id(ISSUE_CONNECTION_LOST, entry_id))
 
     @staticmethod
     def _next_filter_change(data: ParmairData) -> str:
@@ -338,8 +460,14 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
 
     # ── Summer-auto ──────────────────────────────────────────────────────
 
-    def _evaluate_summer_auto(self, data: ParmairData) -> None:
+    def _evaluate_summer_auto(self, data: ParmairData, failed_keys: set[str]) -> None:
         """Run the dwell-gated summer-mode logic for one tick.
+
+        A tick whose Modbus inputs failed to read this cycle is skipped rather
+        than fed: ``data`` then holds the previous cycle's value, which is no
+        fresh evidence to act on, and feeding ``None`` instead would reset
+        the dwell timers — on a controller where one flaky block is routine,
+        a 60-120 min dwell would then rarely complete.
 
         Deliberately defensive (broad except): a bug here must never break
         the polling cycle that carries every other entity's data.
@@ -349,6 +477,9 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
             return
         try:
             source_entity = self.config_entry.options.get(CONF_SUMMER_AUTO_SOURCE)
+            stale = {"summer_mode"} if source_entity else {"summer_mode", "fresh_air_temperature"}
+            if stale & failed_keys:
+                return
             temp = (
                 self._read_source_temperature(source_entity)
                 if source_entity
@@ -358,25 +489,47 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
             action = self._summer_auto_logic.update(
                 dt_util.utcnow(), temp, summer_on, self.summer_auto_params
             )
-            if action is not None and action != summer_on:
-                self.hass.async_create_task(self.async_write("summer_mode", int(action)))
+            if action is not None and action != summer_on and not self._shutting_down:
+                self.config_entry.async_create_background_task(
+                    self.hass,
+                    self._async_summer_auto_write(int(action)),
+                    name="parmair summer-auto write",
+                )
         except Exception:  # noqa: BLE001 - never let this break the update cycle
             _LOGGER.exception("Parmair summer-auto evaluation failed")
 
+    async def _async_summer_auto_write(self, value: int) -> None:
+        """The summer-auto write, with its failure logged rather than unretrieved."""
+        try:
+            await self._async_write_pairs([("summer_mode", value)], user=False)
+        except ParmairConnectionError as err:
+            _LOGGER.warning("Parmair summer-auto write failed: %s", err)
+
     def _read_source_temperature(self, entity_id: str) -> float | None:
+        """The external source's reading in °C (the thresholds are °C)."""
         state = self.hass.states.get(entity_id)
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             return None
-        return self._as_float(state.state)
+        value = self._as_float(state.state)
+        unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+        if (
+            value is not None
+            and unit != UnitOfTemperature.CELSIUS
+            and unit in TemperatureConverter.VALID_UNITS
+        ):
+            return TemperatureConverter.convert(value, unit, UnitOfTemperature.CELSIUS)
+        return value
 
     @staticmethod
     def _as_float(value: object) -> float | None:
+        """``value`` as a finite float, else None (nan/inf count as unavailable)."""
         if value is None:
             return None
         try:
-            return float(value)
+            result = float(value)
         except TypeError, ValueError:
             return None
+        return result if math.isfinite(result) else None
 
     # ── Cooking detection ────────────────────────────────────────────────
 
@@ -416,6 +569,13 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         self.config_entry.async_on_unload(
             async_track_state_change_event(self.hass, entity_ids, self._async_cooking_event)
         )
+        # An unchanged re-report fires EVENT_STATE_REPORTED, not state_changed.
+        # Without it a steady (e.g. integer-quantized humidity) sensor looks
+        # silent to the detector, trips GAP_RESET_S, and the start of the next
+        # cook is swallowed as warm-up.
+        self.config_entry.async_on_unload(
+            async_track_state_report_event(self.hass, entity_ids, self._async_cooking_event)
+        )
         self.config_entry.async_on_unload(
             async_track_time_interval(
                 self.hass,
@@ -446,8 +606,10 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         return DEFAULT_SIGMA_FLOOR
 
     @callback
-    def _async_cooking_event(self, event: Event[EventStateChangedData]) -> None:
-        """Feed one source-sensor state change into the detector.
+    def _async_cooking_event(
+        self, event: Event[EventStateChangedData] | Event[EventStateReportedData]
+    ) -> None:
+        """Feed one source-sensor state change (or unchanged re-report) into the detector.
 
         Broad-except like :meth:`_evaluate_summer_auto`: a malformed state must
         never tear down the state-change listener.
@@ -494,8 +656,12 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
                 # own is still on, so just cancel the pending restore and keep it.
                 self._cooking_restore_cancel()
                 self._cooking_restore_cancel = None
-            elif self.cooking_auto_boost_enabled:
-                self.hass.async_create_task(self._async_cooking_boost_start())
+            elif self.cooking_auto_boost_enabled and not self._shutting_down:
+                self.config_entry.async_create_background_task(
+                    self.hass,
+                    self._async_cooking_boost_start(),
+                    name="parmair cooking boost start",
+                )
         elif result.transition is False:
             self._stop_cooking_heartbeat()
             if self._cooking_boost_owner:
@@ -512,7 +678,7 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
             )
 
     def _start_cooking_heartbeat(self) -> None:
-        if self._cooking_heartbeat_cancel is not None:
+        if self._cooking_heartbeat_cancel is not None or self._shutting_down:
             return
         self._cooking_heartbeat_cancel = async_track_time_interval(
             self.hass, self._async_cooking_heartbeat, timedelta(seconds=COOKING_HEARTBEAT_S)
@@ -526,28 +692,55 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
     async def _async_cooking_boost_start(self) -> None:
         """Claim the boost for a fresh detection — only if safe to own it.
 
-        Skips (no ownership) when the unit is off or boost is already active
-        (manual or CO₂-auto): turning that boost off later isn't ours to do.
+        Skips (no ownership) when the unit is off, boost is already active
+        (manual or CO₂-auto), or the user has picked a mode of their own
+        (fireplace, manual speed): turning that off later isn't ours to do.
         Ownership is set only after the write succeeds, so a failed write leaves
-        no phantom claim.
+        no phantom claim — and not at all if a user mode write overtook us.
         """
-        data = self.data
-        if not data:
-            return
-        if data.get("boost_active") or data.get("power_state") not in _POWER_ON_STATES:
-            return
-        try:
-            await self.async_write_sequence(
-                [("speed_control", SPEED_CONTROL_AUTO), ("control_state", CONTROL_STATE_BOOST)]
-            )
-        except ParmairConnectionError as err:
-            _LOGGER.warning("Parmair cooking auto-boost start failed: %s", err)
-            return
-        self._cooking_boost_owner = True
-        self._cooking_boost_started = dt_util.utcnow()
+        epoch = self._cooking_epoch
+        async with self._write_lock:
+            data = self.data
+            if not data or self._shutting_down or epoch != self._cooking_epoch:
+                return
+            if (
+                data.get("boost_active")
+                or data.get("fireplace_active")
+                or data.get("control_state") == CONTROL_STATE_MANUAL
+                # A just-written manual speed/stop is only reflected in
+                # control_state after its verify-read; speed_control has it
+                # optimistically already.
+                or data.get("speed_control") not in (None, SPEED_CONTROL_AUTO)
+                or data.get("power_state") not in _POWER_ON_STATES
+            ):
+                return
+            try:
+                await self._async_write_pairs_locked(
+                    [("speed_control", SPEED_CONTROL_AUTO), ("control_state", CONTROL_STATE_BOOST)]
+                )
+            except ParmairConnectionError as err:
+                _LOGGER.warning("Parmair cooking auto-boost start failed: %s", err)
+                return
+            if epoch != self._cooking_epoch:
+                return
+            self._cooking_boost_owner = True
+            self._cooking_boost_started = dt_util.utcnow()
+            self._cooking_boost_confirmed = False
+
+    def _drop_cooking_boost(self) -> None:
+        """Give up the boost claim and any pending restore of it."""
+        self._cooking_epoch += 1
+        self._cooking_boost_owner = False
+        self._cooking_boost_started = None
+        self._cooking_boost_confirmed = False
+        if self._cooking_restore_cancel is not None:
+            self._cooking_restore_cancel()
+            self._cooking_restore_cancel = None
 
     def _schedule_cooking_restore(self) -> None:
         """Restore the prior mode after the minimum boost run-time has elapsed."""
+        if self._shutting_down:
+            return
         elapsed = (
             (dt_util.utcnow() - self._cooking_boost_started).total_seconds()
             if self._cooking_boost_started is not None
@@ -568,31 +761,41 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         the boost, we just drop ownership and write nothing.
         """
         self._cooking_restore_cancel = None
-        data = self.data
-        if not self._cooking_boost_owner or not data or not data.get("boost_active"):
-            self._cooking_boost_owner = False
-            self._cooking_boost_started = None
+        if self._shutting_down:
             return
-        try:
-            await self.async_write("control_state", restore_control_state(data))
-        except ParmairConnectionError as err:
-            _LOGGER.warning("Parmair cooking auto-boost restore failed: %s", err)
-        self._cooking_boost_owner = False
-        self._cooking_boost_started = None
+        # Checked under the write lock: a user mode write drops the claim
+        # before it queues for the lock, so it can't be overwritten by us.
+        async with self._write_lock:
+            if self._cooking_boost_owner and self.cooking_active:
+                # Cooking re-triggered while we queued for the lock, too late
+                # for _handle_cooking_result to cancel us: keep the boost and
+                # the claim; the next off-edge schedules a fresh restore.
+                return
+            data = self.data
+            if self._cooking_boost_owner and data and data.get("boost_active"):
+                try:
+                    await self._async_write_pairs_locked(
+                        [("control_state", restore_control_state(data))]
+                    )
+                except ParmairConnectionError as err:
+                    _LOGGER.warning("Parmair cooking auto-boost restore failed: %s", err)
+            self._drop_cooking_boost()
 
     def _reconcile_cooking_boost(self, data: ParmairData) -> None:
         """Drop boost ownership once the boost we started is gone.
 
         Respects a manual boost-off or the unit's own boost timer expiring —
-        we stop trying to restore a boost that's no longer there. Tiny and
-        non-raising by construction (runs inside the poll cycle).
+        we stop trying to restore a boost that's no longer there. Only once a
+        poll has shown the boost active, though: before that, a 0 may come
+        from a read that predates our own write. Tiny and non-raising by
+        construction (runs inside the poll cycle).
         """
-        if self._cooking_boost_owner and not data.get("boost_active"):
-            self._cooking_boost_owner = False
-            self._cooking_boost_started = None
-            if self._cooking_restore_cancel is not None:
-                self._cooking_restore_cancel()
-                self._cooking_restore_cancel = None
+        if not self._cooking_boost_owner:
+            return
+        if data.get("boost_active"):
+            self._cooking_boost_confirmed = True
+        elif self._cooking_boost_confirmed:
+            self._drop_cooking_boost()
 
     async def _async_cooking_save(self, _now: datetime) -> None:
         """Persist learned baselines on the periodic interval."""
@@ -607,11 +810,30 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
 
     async def async_write(self, key: str, value: float | int) -> None:
         """Write one register and optimistically update + schedule a verify."""
-        await self._write_one(key, value)
-        self._schedule_verify(VERIFY_KEY.get(key, key))
+        await self._async_write_pairs([(key, value)], user=True)
 
     async def async_write_sequence(self, pairs: list[tuple[str, float | int]]) -> None:
-        """Write several registers in sequence, verifying only the last one."""
+        """Write several registers atomically in sequence, verifying only the last one."""
+        await self._async_write_pairs(pairs, user=True)
+
+    async def _async_write_pairs(self, pairs: list[tuple[str, float | int]], *, user: bool) -> None:
+        """Take the write lock and write ``pairs``.
+
+        A *user* write that changes the unit's mode drops the cooking boost
+        claim first — before queueing for the lock, so a cooking restore that
+        is already waiting on it sees the claim gone and writes nothing. The
+        cooking/summer-auto glue passes ``user=False`` so its own writes never
+        invalidate themselves.
+        """
+        if user and any(key in _MODE_KEYS for key, _value in pairs):
+            self._drop_cooking_boost()
+        async with self._write_lock:
+            await self._async_write_pairs_locked(pairs)
+
+    async def _async_write_pairs_locked(self, pairs: list[tuple[str, float | int]]) -> None:
+        """Write ``pairs`` in order; the caller holds ``_write_lock``."""
+        if self._shutting_down:
+            raise ParmairConnectionError("write refused: the entry is unloading")
         for key, value in pairs:
             await self._write_one(key, value)
         if pairs:
@@ -624,40 +846,72 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
             raise ValueError(f"{key!r} is not a writable Parmair register")
         raw = encode(value, definition)
         await self.client.write_register(self._map.address(definition), raw)
+        written = decode(raw, definition)
+        values: ParmairData = {key: written}
+        if key == "control_state" and written is not None:
+            derived = _CONTROL_STATE_DERIVED.get(int(written), {})
+            values.update({k: v for k, v in derived.items() if self._find_block(k) is not None})
+        self._async_apply_fresh(values)
+
+    @callback
+    def _async_apply_fresh(self, values: ParmairData, read_started: int | None = None) -> None:
+        """Push write/verify values into ``self.data``, stamped for the poll merge.
+
+        ``read_started`` is the seq a verify-read began at: a key a write
+        stamped after that is newer than what the read saw, so it is left alone.
+        """
+        if read_started is not None:
+            values = {k: v for k, v in values.items() if self._key_seq.get(k, 0) <= read_started}
+        if not values:
+            return
+        self._seq += 1
+        for key in values:
+            self._key_seq[key] = self._seq
         updated: ParmairData = dict(self.data) if self.data is not None else {}
-        updated[key] = decode(raw, definition)
+        updated.update(values)
         self.async_set_updated_data(updated)
 
     def _schedule_verify(self, verify_key: str) -> None:
-        if self._verify_cancel is not None:
-            self._verify_cancel()
-        self._verify_cancel = async_call_later(
-            self.hass, VERIFY_DELAY, partial(self._async_verify, verify_key)
-        )
-
-    async def _async_verify(self, verify_key: str, _now: datetime) -> None:
-        self._verify_cancel = None
+        """Queue ``verify_key``'s block for the (debounced) verify-read."""
+        if self._shutting_down:
+            return
         block = self._find_block(verify_key)
         if block is None:
             return
-        try:
-            raw = await self.client.read_block(block.address, block.count)
-        except ParmairConnectionError as err:
-            _LOGGER.debug("Parmair verify read for %s failed: %s", verify_key, err)
-            return
-        updated: ParmairData = dict(self.data) if self.data is not None else {}
-        updated.update(self._decode_block(block, raw))
-        self.async_set_updated_data(updated)
+        self._pending_verify[block.address] = block
+        if self._verify_cancel is not None:
+            self._verify_cancel()
+        self._verify_cancel = async_call_later(self.hass, VERIFY_DELAY, self._async_verify)
+
+    async def _async_verify(self, _now: datetime) -> None:
+        """Re-read every block queued since the last verify, each once."""
+        self._verify_cancel = None
+        blocks = list(self._pending_verify.values())
+        self._pending_verify.clear()
+        for block in blocks:
+            if self._shutting_down:
+                return
+            started = self._seq
+            try:
+                raw = await self.client.read_block(block.address, block.count)
+            except ParmairConnectionError as err:
+                _LOGGER.debug("Parmair verify read of block %s failed: %s", block.address, err)
+                continue
+            self._async_apply_fresh(self._decode_block(block, raw), read_started=started)
 
     async def async_shutdown(self) -> None:
-        """Cancel pending timers, flush cooking baselines, then base shutdown."""
+        """Refuse new work, cancel pending timers, base shutdown, flush baselines."""
+        self._shutting_down = True
         if self._verify_cancel is not None:
             self._verify_cancel()
             self._verify_cancel = None
+        self._pending_verify.clear()
         self._stop_cooking_heartbeat()
         if self._cooking_restore_cancel is not None:
             self._cooking_restore_cancel()
             self._cooking_restore_cancel = None
+        # Before the flush's await, so no refresh can be scheduled meanwhile.
+        await super().async_shutdown()
         if self.cooking_detector is not None and self._cooking_store is not None:
             try:
                 await self._cooking_store.async_save(
@@ -665,7 +919,6 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
                 )
             except Exception:  # noqa: BLE001 - best-effort flush on unload
                 _LOGGER.warning("Parmair cooking baseline final save failed", exc_info=True)
-        await super().async_shutdown()
 
 
 type ParmairConfigEntry = ConfigEntry[ParmairCoordinator]

@@ -11,10 +11,19 @@ from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.storage import Store
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.parmair.const import DOMAIN
-from custom_components.parmair.coordinator import ParmairCoordinator
+from custom_components.parmair.const import (
+    CARD_FILENAME,
+    CARD_URL_BASE,
+    COOKING_STORAGE_KEY,
+    COOKING_STORAGE_VERSION,
+    DOMAIN,
+    ISSUE_FILTER_CHANGE_DUE,
+)
+from custom_components.parmair.coordinator import ParmairCoordinator, issue_id
 from custom_components.parmair.modbus import UNIT_ID_DEFAULT, tcp_params
 
 
@@ -122,3 +131,126 @@ async def test_the_unit_is_borrowed_for_the_configured_endpoint(
     assert borrowed_entry is entry
     assert params == tcp_params(entry.data[CONF_HOST], entry.data[CONF_PORT])
     assert unit_id == UNIT_ID_DEFAULT
+
+
+async def test_failed_setup_still_releases_the_client(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    rexo120_bank: dict[int, int],
+) -> None:
+    """A ConfigEntryNotReady must not leave the lost-link callback subscribed.
+
+    ``client.close()`` used to run only from async_unload_entry, which a failed
+    setup never reaches; every retry then leaked one more subscription.
+    """
+    fake_client = FakeModbusClient(rexo120_bank)
+    fake_client.fail_connect = True
+
+    with patch("custom_components.parmair.modbus.create_client", return_value=fake_client):
+        mock_config_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+    assert fake_client.close_calls == 1
+
+
+async def test_unload_shuts_the_coordinator_down_before_releasing_the_client(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    """LIFO on_unload: coordinator shutdown (timers off) starts before the release."""
+    entry, fake_client = await async_setup_integration(rexo120_bank)
+    coordinator = entry.runtime_data
+    order: list[str] = []
+    real_shutdown = coordinator.async_shutdown
+    real_close = fake_client.close
+
+    async def shutdown() -> None:
+        order.append("shutdown")
+        await real_shutdown()
+
+    async def close() -> None:
+        order.append("close")
+        await real_close()
+
+    # The on_unload stack holds the bound methods, so swap them in place.
+    unload = entry._on_unload
+    unload[unload.index(coordinator.async_shutdown)] = shutdown
+    unload[unload.index(fake_client.close)] = close
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert order == ["shutdown", "close"]
+    assert fake_client.close_calls == 1
+
+
+async def test_remove_entry_cleans_up_issues_and_cooking_store(
+    hass: HomeAssistant,
+    async_setup_integration,
+    rexo120_bank: dict[int, int],
+    hass_storage: dict,
+) -> None:
+    entry, fake_client = await async_setup_integration(rexo120_bank)
+    fake_client.bank[1205] = 0  # filter due -> issue raised
+    await entry.runtime_data.async_refresh()
+    filter_issue = issue_id(ISSUE_FILTER_CHANGE_DUE, entry.entry_id)
+    assert ir.async_get(hass).async_get_issue(DOMAIN, filter_issue) is not None
+    store_key = COOKING_STORAGE_KEY.format(entry.entry_id)
+    await Store(hass, COOKING_STORAGE_VERSION, store_key).async_save({"sensors": {}})
+    assert store_key in hass_storage
+
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert ir.async_get(hass).async_get_issue(DOMAIN, filter_issue) is None
+    assert store_key not in hass_storage
+
+
+async def test_remove_last_entry_removes_the_lovelace_resource(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    rexo120_bank: dict[int, int],
+) -> None:
+    """The card is shared by all entries: it goes with the last one, not before."""
+    from homeassistant.components.lovelace.const import LOVELACE_DATA
+    from homeassistant.setup import async_setup_component
+
+    assert await async_setup_component(hass, "http", {})
+    assert await async_setup_component(hass, "lovelace", {"lovelace": {"mode": "storage"}})
+    await hass.async_block_till_done()
+
+    second = MockConfigEntry(
+        domain=DOMAIN,
+        data={**mock_config_entry.data, CONF_HOST: "192.168.101.57"},
+        options=dict(mock_config_entry.options),
+        title="Parmair 2",
+    )
+    with patch(
+        "custom_components.parmair.modbus.create_client",
+        side_effect=[FakeModbusClient(rexo120_bank), FakeModbusClient(rexo120_bank)],
+    ):
+        for entry in (mock_config_entry, second):
+            entry.add_to_hass(hass)
+            await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+
+    card_base = f"{CARD_URL_BASE}/{CARD_FILENAME}"
+
+    def card_resources() -> list:
+        return [
+            item
+            for item in hass.data[LOVELACE_DATA].resources.async_items()
+            if str(item["url"]).startswith(card_base)
+        ]
+
+    assert len(card_resources()) == 1
+
+    await hass.config_entries.async_remove(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert len(card_resources()) == 1  # the other unit still uses it
+
+    await hass.config_entries.async_remove(second.entry_id)
+    await hass.async_block_till_done()
+    assert card_resources() == []
+    assert hass.data.get(f"{DOMAIN}_card") is None  # a re-add registers it again

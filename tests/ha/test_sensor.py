@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 from unittest.mock import patch
 
@@ -9,13 +10,16 @@ from conftest import FakeModbusClient
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.parmair.const import (
     CONF_CAPABILITIES,
+    CONF_COOKING_SENSORS,
     CONF_REGISTER_MAP,
     CONF_SCAN_INTERVAL,
     DOMAIN,
+    SIGNAL_COOKING_UPDATE,
 )
 
 
@@ -166,3 +170,51 @@ async def test_unknown_control_state_raw_reads_as_unknown(
     entry, _fake_client = await async_setup_integration(rexo120_bank)
 
     assert _state(hass, entry, "control_state") == "unknown"
+
+
+async def test_cooking_score_ignores_polls_and_survives_modbus_outage(
+    hass: HomeAssistant,
+    rexo120_bank: dict[int, int],
+    rexo120_capabilities_dict: dict[str, Any],
+    freezer,
+) -> None:
+    """The dispatcher-driven score is not re-written by every poll (recorder churn)
+    and stays available while the Modbus poll fails — it's computed off kitchen
+    sensor events, not the unit."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "192.168.101.56",
+            CONF_PORT: 502,
+            CONF_REGISTER_MAP: "v1_87",
+            CONF_CAPABILITIES: rexo120_capabilities_dict,
+        },
+        options={CONF_SCAN_INTERVAL: 10, CONF_COOKING_SENSORS: ["sensor.test_voc"]},
+        title="Parmair",
+    )
+    fake_client = FakeModbusClient(rexo120_bank)
+    with patch("custom_components.parmair.modbus.create_client", return_value=fake_client):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    coordinator = entry.runtime_data
+    entity_id = _entity_id(hass, entry, "cooking_score")
+    before = hass.states.get(entity_id)
+    # HA mutates ``last_reported`` on the live State object, so snapshot it.
+    reported = before.last_reported
+
+    freezer.tick(timedelta(seconds=30))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).last_reported == reported
+
+    fake_client.fail_all = True
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state != "unavailable"
+
+    # The dispatcher signal is still what refreshes it.
+    freezer.tick(timedelta(seconds=30))
+    async_dispatcher_send(hass, SIGNAL_COOKING_UPDATE.format(entry.entry_id))
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).last_reported > reported

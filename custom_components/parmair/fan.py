@@ -21,7 +21,7 @@ from .const import (
     POWER_STATE_ON,
     POWER_STATE_TURNING_OFF,
     POWER_STATE_TURNING_ON,
-    SPEED_CONTROL_STOP,
+    SPEED_CONTROL_AUTO,
 )
 from .coordinator import ParmairConfigEntry, ParmairCoordinator
 from .entity import ParmairEntity
@@ -115,17 +115,21 @@ class ParmairFan(ParmairEntity, FanEntity):
 
     async def async_set_percentage(self, percentage: int) -> None:
         if percentage == 0:
-            await self.coordinator.async_write("speed_control", SPEED_CONTROL_STOP)
+            # HA's fan contract: 0 % means off. Writing speed_control = 1
+            # (stop) instead would halt the fans while power_state — and so
+            # this entity — kept reading "on" at 0 %. decrease_speed from the
+            # lowest speed lands here too.
+            await self.async_turn_off()
             return
-        speed = max(1, min(5, round(percentage / 20)))
-        await self.coordinator.async_write("speed_control", speed + 1)
+        speed = max(1, min(SPEED_COUNT, round(percentage / 20)))
+        await self._async_write("speed_control", speed + 1)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         value = _CONTROL_STATE_FROM_PRESET[preset_mode]
         # Releasing manual speed control first is required before the
         # control-state write takes effect.
-        await self.coordinator.async_write_sequence(
-            [("speed_control", 0), ("control_state", value)]
+        await self._async_write_sequence(
+            [("speed_control", SPEED_CONTROL_AUTO), ("control_state", value)]
         )
 
     async def async_turn_on(
@@ -134,11 +138,12 @@ class ParmairFan(ParmairEntity, FanEntity):
         preset_mode: str | None = None,
         **kwargs,
     ) -> None:
-        await self.coordinator.async_write("power_state", POWER_STATE_TURNING_ON)
+        await self._async_write("power_state", POWER_STATE_TURNING_ON)
         if preset_mode is not None:
             await self.async_set_preset_mode(preset_mode)
-        elif percentage is not None:
+        elif percentage:
+            # ``percentage == 0`` on turn_on is not a request to turn back off.
             await self.async_set_percentage(percentage)
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self.coordinator.async_write("power_state", POWER_STATE_TURNING_OFF)
+        await self._async_write("power_state", POWER_STATE_TURNING_OFF)

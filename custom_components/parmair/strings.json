@@ -51,7 +51,8 @@
       }
     },
     "error": {
-      "cannot_connect": "Couldn't connect to the unit to re-detect its sensors and options."
+      "cannot_connect": "Couldn't connect to the unit to re-detect its sensors and options.",
+      "not_parmair": "Connected, but the device didn't answer like a Parmair MAC unit, so its sensors and options weren't re-detected."
     }
   },
   "issues": {
@@ -441,8 +442,23 @@
     },
     "fan": {
       "fan": {
-        "name": "Ventilation"
+        "name": "Ventilation",
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "home": "Home",
+              "away": "Away",
+              "boost": "Boost",
+              "fireplace": "Fireplace"
+            }
+          }
+        }
       }
+    }
+  },
+  "exceptions": {
+    "write_failed": {
+      "message": "Could not write to the Parmair unit: {error}"
     }
   }
 }

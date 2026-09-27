@@ -93,4 +93,4 @@ class ParmairSelect(ParmairEntity, SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         raw = self._value_to_raw[int(option)]
-        await self.coordinator.async_write(self._key, raw)
+        await self._async_write(self._key, raw)

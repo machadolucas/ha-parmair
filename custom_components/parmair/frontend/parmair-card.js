@@ -94,8 +94,11 @@ function registerCard(card) {
  * accent colors), never solid opaque colors.
  *
  * This stylesheet is injected into the shadow root exactly ONCE (see
- * `_render`); everything that changes per render — gradient stops, drain-bar
- * widths, the flow-animation duration — is inline in the markup instead.
+ * `_render`); everything that changes with entity state — gradient stops,
+ * drain-bar widths, the flow-animation duration — is inline in the markup
+ * instead. The one purely time-derived value (the flow-animation phase,
+ * `--flow-delay`) is set with `style.setProperty` after the markup is written,
+ * so it can't make two otherwise-identical renders differ (see `_render`).
  */
 const CARD_CSS = `
   :host { display: block; }
@@ -183,8 +186,9 @@ const CARD_CSS = `
   .airflow-wrap { position: relative; }
   .airflow-svg { width: 100%; height: auto; display: block; overflow: visible; }
   .flow-base { fill: none; stroke-width: 14; stroke-linecap: round; opacity: 0.22; }
-  /* Dash travel speed follows the fan: each render sets --flow-duration
-     inline on .airflow-wrap (4s / speed, so speed 1 ≈ 4s … speed 5 = 0.8s);
+  /* Dash travel speed follows the fan: the markup sets --flow-duration
+     inline on .airflow-wrap (4s / speed, so speed 1 ≈ 4s … speed 5 = 0.8s)
+     and _render sets --flow-delay after writing it;
      .flow-paused (fan off / speed 0) freezes the dashes in place. */
   .flow-dash { fill: none; stroke-width: 5; stroke-linecap: round; stroke-dasharray: 4 8;
     animation: parmair-flow 1.6s linear infinite;
@@ -239,6 +243,7 @@ const CARD_CSS = `
     color: var(--error-color, #db4437); cursor: pointer; }
 
   .hint { color: var(--secondary-text-color); padding: 4px 2px 8px; font-size: 0.85em; }
+  .hint-warn { color: var(--error-color, #db4437); }
 `;
 
 // Cross-flow HRV diagram geometry (viewBox 0 0 280 120). Fresh (top-left)
@@ -257,7 +262,7 @@ const WARM = "var(--warning-color, #e6a23c)";
 const NEUTRAL = `color-mix(in srgb, ${COOL} 50%, ${WARM})`;
 
 // Every entity key the card ever reads in rendering or click handling —
-// used to narrow `_relevantStates()` below. The device carries plenty of
+// used to narrow `_renderSig()` below. The device carries plenty of
 // entities the card never touches (fan outputs, humidity averages, timers,
 // diagnostics); without this allowlist any of those changing would still
 // force a full innerHTML rebuild.
@@ -297,15 +302,66 @@ const KEYS_RENDERED = [
   "fireplace_duration",
 ];
 
+// The only attributes any render reads (climate setpoint + the stepper bounds
+// of number/climate entities). The change signature looks at these and the
+// state string only, so an attribute-only update the card never shows (the
+// cooking detector's score/per-sensor payload, a friendly_name) can't trigger
+// a rebuild.
+const ATTRS_RENDERED = ["temperature", "min", "max", "step", "min_temp", "max_temp", "target_temp_step"];
+
+// Discovery retry: 2 s, 4 s, 8 s … capped at a minute, forever — a transient
+// WS failure at dashboard load shouldn't leave the card empty until reload.
+const DISCOVERY_RETRY_BASE_MS = 2000;
+const DISCOVERY_RETRY_MAX_MS = 60000;
+// Registry updates arrive in bursts (an integration reload touches every
+// entity); coalesce them into one re-discovery.
+const REDISCOVER_DEBOUNCE_MS = 1000;
+// How long a failed-action message stays visible.
+const ERROR_VISIBLE_MS = 6000;
+
 class ParmairCard extends HTMLElement {
   constructor() {
     super();
     // Flow-dash animation phase, carried across innerHTML rebuilds — see
-    // `_flowPhaseVars`.
+    // `_flowDelay`.
     this._flowPhase = 0;
     this._flowPhaseAt = null;
     this._flowDur = 0;
     this._flowRunning = false;
+    this._flowNext = null;
+    // key -> entity_id, built once the registries load; null means "not
+    // resolved yet", {} means "resolved, nothing found". Survives setConfig
+    // calls that keep the same device_id (the editor calls setConfig on every
+    // keystroke — refetching both full registries each time was wasteful).
+    this._entities = null;
+    this._deviceStatus = null; // null | "ok" | "missing" (configured id) | "none"
+    this._mapSig = null;
+    this._mapVersion = 0;
+    this._discoveryGen = 0;
+    this._discoverInFlight = false;
+    this._rediscoverQueued = false;
+    this._discoverFailures = 0;
+    this._retryTimer = null;
+    this._rediscoverTimer = null;
+    this._seenRegistry = undefined;
+    this._seenDevices = undefined;
+    this._registrySeen = false;
+    this._needsRediscover = false;
+    this._missingCheckedVersion = -1;
+    this._errorMsg = null;
+    this._errorTimer = null;
+    this._lastSig = null;
+    this._lastHtml = null;
+    // Power pill's 2-step "turn off?" confirmation: a deadline timestamp
+    // (not just a bare setTimeout) so the visible state is always recomputed
+    // from `Date.now()` at render time, however many renders happen while
+    // it's pending.
+    this._pwrConfirmUntil = null;
+    this._pwrRevertTimer = null;
+    // Settings section visibility — pure per-instance UI state, resets when
+    // the card is recreated, deliberately not persisted in config.
+    this._expanded = false;
+    this._forceNextRender = false;
   }
 
   setConfig(config) {
@@ -319,6 +375,7 @@ class ParmairCard extends HTMLElement {
     if (cfg.show_metrics === undefined && cfg.show_chips !== undefined) {
       cfg.show_metrics = cfg.show_chips;
     }
+    const prevDevice = this._config ? this._config.device_id || null : undefined;
     this._config = {
       show_fan_row: true,
       show_airflow: true,
@@ -327,31 +384,67 @@ class ParmairCard extends HTMLElement {
       compact: false,
       ...cfg,
     };
-    // key -> entity_id, built lazily once the registries load; null means
-    // "not resolved yet", {} means "resolved, nothing found".
-    this._entities = null;
-    this._entitiesPromise = null;
-    this._lastStates = null;
-    this._lastConfigSig = null;
-    this._lastEntitiesReady = null;
-    // Power pill's 2-step "turn off?" confirmation: a deadline timestamp
-    // (not just a bare setTimeout) so the visible state is always recomputed
-    // from `Date.now()` at render time, however many renders happen while
-    // it's pending.
-    this._pwrConfirmUntil = null;
-    this._pwrRevertTimer = null;
-    // Settings section visibility — pure per-instance UI state, resets when
-    // the card is recreated, deliberately not persisted in config.
-    this._expanded = false;
-    this._forceNextRender = false;
+    this._configSig = JSON.stringify(this._config);
+    // Only a different device invalidates the entity map; any in-flight or
+    // scheduled discovery for the old device is superseded via the generation.
+    if ((this._config.device_id || null) !== prevDevice) {
+      this._discoveryGen += 1;
+      this._entities = null;
+      this._deviceStatus = null;
+      this._mapSig = null;
+      this._mapVersion += 1;
+      this._discoverFailures = 0;
+      clearTimeout(this._retryTimer);
+      this._retryTimer = null;
+      clearTimeout(this._rediscoverTimer);
+      this._rediscoverTimer = null;
+      // A "Turn off?" armed for the old device must not let one tap power
+      // off the new one unconfirmed.
+      clearTimeout(this._pwrRevertTimer);
+      this._pwrRevertTimer = null;
+      this._pwrConfirmUntil = null;
+    }
+    this._maybeDiscover();
     this._render();
   }
 
   set hass(hass) {
     this._hass = hass;
-    if (!this._entitiesPromise) {
-      this._entitiesPromise = this._discoverEntities();
+    if (this._entities !== null) {
+      // The frontend replaces `hass.entities` / `hass.devices` (the display
+      // registries) with new objects on every registry update and keeps the
+      // references otherwise, so identity is a free "registry changed" signal
+      // — covers entities being enabled/disabled, added or re-parented, and a
+      // missing configured device coming back.
+      if (hass.entities !== this._seenRegistry || hass.devices !== this._seenDevices) {
+        if (this._registrySeen) this._scheduleRediscover();
+        this._registrySeen = true;
+        this._seenRegistry = hass.entities;
+        this._seenDevices = hass.devices;
+      }
+      // Belt and braces for a frontend without `hass.entities`: a mapped
+      // entity vanishing from the state machine means the map is stale. Once
+      // per map version, so an entity that simply has no state yet can't
+      // cause a discovery loop.
+      if (this._missingCheckedVersion !== this._mapVersion) {
+        const ids = Object.values(this._entities);
+        if (ids.length && ids.some((id) => !hass.states[id])) {
+          this._missingCheckedVersion = this._mapVersion;
+          this._scheduleRediscover();
+        }
+      }
+    } else {
+      // A registry change while the first discovery is in flight may not be
+      // in its response; run once more after it lands.
+      if (this._discoverInFlight && this._registrySeen &&
+          (hass.entities !== this._seenRegistry || hass.devices !== this._seenDevices)) {
+        this._rediscoverQueued = true;
+      }
+      this._registrySeen = true;
+      this._seenRegistry = hass.entities;
+      this._seenDevices = hass.devices;
     }
+    this._maybeDiscover();
     this._render();
   }
 
@@ -377,35 +470,108 @@ class ParmairCard extends HTMLElement {
 
   // ---- entity discovery -------------------------------------------------
 
+  // Starts the first discovery as soon as both hass and config exist; later
+  // runs are driven by device_id changes, registry changes and retries.
+  _maybeDiscover() {
+    if (!this._hass || !this._config) return;
+    if (this._entities !== null || this._discoverInFlight || this._retryTimer) return;
+    this._discoverEntities();
+  }
+
+  _scheduleRediscover() {
+    // Detached (card removed or its view hidden): don't keep a timer — and
+    // with it the card — alive; connectedCallback resumes discovery.
+    if (this._detached) {
+      this._needsRediscover = true;
+      return;
+    }
+    clearTimeout(this._rediscoverTimer);
+    this._rediscoverTimer = setTimeout(() => {
+      this._rediscoverTimer = null;
+      this._discoverEntities();
+    }, REDISCOVER_DEBOUNCE_MS);
+  }
+
+  _scheduleRetry() {
+    if (this._detached) {
+      this._needsRediscover = true;
+      return;
+    }
+    clearTimeout(this._retryTimer);
+    const delay = Math.min(
+      DISCOVERY_RETRY_MAX_MS,
+      DISCOVERY_RETRY_BASE_MS * 2 ** Math.max(0, this._discoverFailures - 1),
+    );
+    this._retryTimer = setTimeout(() => {
+      this._retryTimer = null;
+      this._discoverEntities();
+    }, delay);
+  }
+
   async _discoverEntities() {
+    if (!this._hass || !this._config) return;
+    if (this._discoverInFlight) {
+      this._rediscoverQueued = true;
+      return;
+    }
+    const gen = this._discoveryGen;
+    const wanted = this._config.device_id || null;
+    this._discoverInFlight = true;
     try {
       const [entities, devices] = await Promise.all([
         this._hass.callWS({ type: "config/entity_registry/list" }),
         this._hass.callWS({ type: "config/device_registry/list" }),
       ]);
+      if (gen !== this._discoveryGen) return; // superseded by a device_id change
       let device = null;
-      if (this._config.device_id) {
-        device = devices.find((d) => d.id === this._config.device_id) || null;
-      }
-      if (!device) {
+      let status;
+      if (wanted) {
+        // An explicitly configured device that's gone must NOT fall back to
+        // "the first Parmair device": on a multi-unit install the controls
+        // would silently drive the wrong unit.
+        device = devices.find((d) => d.id === wanted) || null;
+        status = device ? "ok" : "missing";
+      } else {
         device =
           devices.find(
             (d) => Array.isArray(d.identifiers) && d.identifiers.some((ident) => ident[0] === "parmair"),
           ) || null;
+        status = device ? "ok" : "none";
       }
       const map = {};
       if (device) {
         entities
-          .filter((e) => e.device_id === device.id && e.unique_id)
+          // Disabled entities have no state; mapping one would render a
+          // control that can only ever show "–".
+          .filter((e) => e.device_id === device.id && e.unique_id && !e.disabled_by)
           .forEach((e) => {
             map[keyFromUniqueId(e.unique_id)] = e.entity_id;
           });
       }
-      this._entities = map;
+      this._discoverFailures = 0;
+      clearTimeout(this._retryTimer);
+      this._retryTimer = null;
+      const sig = `${status}|${JSON.stringify(map)}`;
+      if (sig !== this._mapSig || this._entities === null) {
+        this._mapSig = sig;
+        this._mapVersion += 1;
+        this._entities = map;
+        this._deviceStatus = status;
+      }
     } catch (err) {
-      // Best-effort: an older HA without these WS commands, or a transient
-      // failure, just leaves the card showing placeholders.
-      this._entities = {};
+      if (gen !== this._discoveryGen) return;
+      // Transient failure (WS hiccup at dashboard load) or an older HA
+      // without these commands: keep any map we already have and retry with
+      // backoff instead of caching the failure for the card's lifetime.
+      this._discoverFailures += 1;
+      this._scheduleRetry();
+    } finally {
+      this._discoverInFlight = false;
+      if (gen !== this._discoveryGen || this._rediscoverQueued) {
+        this._rediscoverQueued = false;
+        if (this._detached) this._needsRediscover = true;
+        else this._discoverEntities();
+      }
     }
     this._render();
   }
@@ -533,7 +699,11 @@ class ParmairCard extends HTMLElement {
   _speedRowHtml() {
     const controlState = this._raw("control_state");
     const isManual = controlState === "manual";
-    const autoActive = controlState != null && controlState !== "manual";
+    // "Auto" = any preset (home/away/boost/fireplace, incl. week-clock
+    // variants) is in charge. An unknown/unavailable control state says
+    // nothing either way, so it must not light the pill.
+    const autoActive =
+      controlState != null && controlState !== "unknown" && controlState !== "unavailable" && !isManual;
     const n = this._speedNumber();
     const disabledAll = !this._isOn("fan");
     const minusDisabled = disabledAll || n == null || n <= 1;
@@ -541,7 +711,7 @@ class ParmairCard extends HTMLElement {
     const display = n == null ? "–" : String(n);
     return `<div class="speed-row">
       <span class="speed-label">Speed</span>
-      <button type="button" class="auto-pill${autoActive ? " active" : ""}" data-action="preset-auto" title="Auto (preset control)" aria-label="Auto"${disabledAll ? " disabled" : ""}><ha-icon icon="mdi:fan-auto"></ha-icon></button>
+      <button type="button" class="auto-pill${autoActive ? " active" : ""}" data-action="preset-auto" title="Auto (preset control)" aria-label="Auto" aria-pressed="${autoActive}"${disabledAll ? " disabled" : ""}><ha-icon icon="mdi:fan-auto"></ha-icon></button>
       <div class="stepper">
         <button type="button" class="step-btn" data-action="speed-step" data-dir="-1" aria-label="Decrease speed"${minusDisabled ? " disabled" : ""}>−</button>
         <span class="speed-value${!isManual ? " dimmed" : ""}">${display}</span>
@@ -629,7 +799,7 @@ class ParmairCard extends HTMLElement {
     return `<div class="ep ${posClass}"${moreInfo}><span class="ep-l">${esc(label)}</span><span class="ep-v">${value}</span></div>`;
   }
 
-  // Every render tears down and recreates the flow-dash SVG paths, which
+  // Every markup rewrite tears down and recreates the flow-dash SVG paths, which
   // restarts their CSS keyframe animation at phase 0 — visible as the dash
   // pattern jumping on every coordinator poll (~10s), and again whenever a
   // fan-speed change remaps `--flow-duration` mid-animation. Fix: track how
@@ -637,7 +807,12 @@ class ParmairCard extends HTMLElement {
   // animation-delay, so the freshly (re)created element picks up mid-cycle
   // instead of restarting. Phase only advances while previously running —
   // paused stays frozen — and is stored as a 0..1 fraction of one cycle.
-  _flowPhaseVars(running, duration) {
+  //
+  // Only called when the markup is actually rewritten (see `_render`): while
+  // the HTML is unchanged the existing elements keep animating on their own,
+  // and since running/duration are both baked into that markup, neither can
+  // change without a rewrite — so the elapsed-phase bookkeeping stays exact.
+  _flowDelay(running, duration) {
     const now = performance.now();
     if (this._flowRunning && this._flowPhaseAt != null && this._flowDur > 0) {
       const elapsedCycles = (now - this._flowPhaseAt) / 1000 / this._flowDur;
@@ -646,7 +821,7 @@ class ParmairCard extends HTMLElement {
     this._flowPhaseAt = now;
     this._flowDur = duration;
     this._flowRunning = running;
-    return `--flow-duration:${duration}s;--flow-delay:-${(this._flowPhase * duration).toFixed(3)}s`;
+    return `-${(this._flowPhase * duration).toFixed(3)}s`;
   }
 
   _airflowHtml() {
@@ -678,11 +853,12 @@ class ParmairCard extends HTMLElement {
     const running = this._isOn("fan") && speed != null && speed > 0;
     const duration = running ? (4 / speed).toFixed(2) : "1.6";
     const pausedCls = running ? "" : " flow-paused";
-    const flowVars = this._flowPhaseVars(running, Number(duration));
+    // Picked up by `_render` once the markup is in the DOM (--flow-delay).
+    this._flowNext = { running, duration: Number(duration) };
     // The temperature labels are HTML overlays (not SVG <text>) so they can
     // carry a backdrop-filter blur — SVG text can't — keeping them readable
     // where they sit on top of the wide flow channels.
-    return `<div class="airflow-wrap${pausedCls}" style="${flowVars}">
+    return `<div class="airflow-wrap${pausedCls}" style="--flow-duration:${duration}s">
       <svg class="airflow-svg" viewBox="0 0 280 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
         <defs>
           <linearGradient id="pg-fs" gradientUnits="userSpaceOnUse" x1="${AIRFLOW_FRESH.x}" y1="${AIRFLOW_FRESH.y}" x2="${AIRFLOW_SUPPLY.x}" y2="${AIRFLOW_SUPPLY.y}">
@@ -737,8 +913,15 @@ class ParmairCard extends HTMLElement {
   // which one is decided by `action` and resolved in `_onClick`. The label
   // (and only the label — the buttons carry data-action, which wins) opens
   // the entity's more-info dialog.
-  _stepRowHtml(label, key, action, current, min, max, step, formatFn) {
+  //
+  // Bounds come from the entity itself (number: min/max/step; climate:
+  // min_temp/max_temp/target_temp_step), which HA has already converted to
+  // the display unit — hard-coded Celsius limits made a Fahrenheit install's
+  // 68 °F setpoint read as "above max 25". `fallback` ([min, max, step]) only
+  // covers an entity that doesn't report them.
+  _stepRowHtml(label, key, action, current, fallback, formatFn) {
     if (!this._has(key)) return "";
+    const [min, max, step] = this._stepBounds(key, action, fallback);
     const minusDisabled = current == null || current <= min;
     const plusDisabled = current == null || current >= max;
     const display = current == null ? "–" : formatFn(current);
@@ -750,6 +933,18 @@ class ParmairCard extends HTMLElement {
         <button type="button" class="step-btn sm" data-action="${action}" data-key="${key}" data-dir="1" data-min="${min}" data-max="${max}" data-step="${step}" aria-label="Increase ${esc(label)}"${plusDisabled ? " disabled" : ""}>+</button>
       </div>
     </div>`;
+  }
+
+  _stepBounds(key, action, fallback) {
+    const st = this._state(key);
+    const attrs = (st && st.attributes) || {};
+    const names = action === "climate-step" ? ["min_temp", "max_temp", "target_temp_step"] : ["min", "max", "step"];
+    const out = names.map((name, i) => {
+      const n = Number(attrs[name]);
+      return attrs[name] != null && Number.isFinite(n) ? n : fallback[i];
+    });
+    if (!(out[2] > 0)) out[2] = fallback[2];
+    return out;
   }
 
   _toggleRowHtml(label, key) {
@@ -766,14 +961,14 @@ class ParmairCard extends HTMLElement {
     const pct = (v) => `${fmt0(v)}%`;
     const rows = [
       this._powerRowHtml(),
-      this._stepRowHtml("Speed when home", "home_speed", "num-step", this._num("home_speed"), 1, 5, 1, fmt0),
-      this._stepRowHtml("Speed when away", "away_speed", "num-step", this._num("away_speed"), 1, 5, 1, fmt0),
+      this._stepRowHtml("Speed when home", "home_speed", "num-step", this._num("home_speed"), [1, 5, 1], fmt0),
+      this._stepRowHtml("Speed when away", "away_speed", "num-step", this._num("away_speed"), [1, 5, 1], fmt0),
       this._stepRowHtml("Supply target", "supply_temperature_target", "climate-step",
-        this._climateTarget("supply_temperature_target"), 15, 25, 0.5, fmtTemp),
+        this._climateTarget("supply_temperature_target"), [15, 25, 0.5], fmtTemp),
       this._stepRowHtml("Extract target (summer)", "extract_temperature_target", "climate-step",
-        this._climateTarget("extract_temperature_target"), 18, 26, 0.5, fmtTemp),
+        this._climateTarget("extract_temperature_target"), [18, 26, 0.5], fmtTemp),
       this._stepRowHtml("Defrost min efficiency", "defrost_min_efficiency", "num-step",
-        this._num("defrost_min_efficiency"), 0, 100, 1, pct),
+        this._num("defrost_min_efficiency"), [0, 100, 1], pct),
       this._toggleRowHtml("HRU temp control", "hru_temperature_control"),
       this._toggleRowHtml("Summer mode", "summer_mode"),
       this._toggleRowHtml("Post-heating", "post_heating"),
@@ -788,7 +983,11 @@ class ParmairCard extends HTMLElement {
   // ---- rendering: alerts + assembly -----------------------------------------
 
   _fmtDate(v) {
-    const d = new Date(v);
+    // A date sensor's state is a bare "YYYY-MM-DD", which `new Date()` parses
+    // as UTC midnight — shown as the previous day anywhere west of UTC. Build
+    // it as a local date instead; anything else takes the generic parse.
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v));
+    const d = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : new Date(v);
     if (Number.isNaN(d.getTime())) return esc(v);
     return esc(d.toLocaleDateString());
   }
@@ -812,7 +1011,23 @@ class ParmairCard extends HTMLElement {
     const cfg = this._config;
     const sections = [this._headerHtml()];
     if (this._entities === null) {
-      sections.push(`<div class="hint">Loading Parmair entities…</div>`);
+      sections.push(
+        this._discoverFailures > 0
+          ? `<div class="hint">Couldn't load the Parmair entities — retrying…</div>`
+          : `<div class="hint">Loading Parmair entities…</div>`,
+      );
+      return `<div class="card-wrap">${sections.join("")}</div>`;
+    }
+    if (this._deviceStatus === "missing") {
+      // No controls at all: rendering them against a fallback device is
+      // exactly the wrong-unit hazard the explicit device_id exists to avoid.
+      sections.push(
+        `<div class="hint hint-warn">The configured Parmair device (${esc(this._config.device_id)}) was not found. Pick a device in the card editor.</div>`,
+      );
+      return `<div class="card-wrap">${sections.join("")}</div>`;
+    }
+    if (this._deviceStatus === "none") {
+      sections.push(`<div class="hint">No Parmair device found.</div>`);
       return `<div class="card-wrap">${sections.join("")}</div>`;
     }
     const panels = [this._controlsPanelHtml()];
@@ -821,37 +1036,54 @@ class ParmairCard extends HTMLElement {
     sections.push(`<div class="body-grid${singleCls}">${panels.join("")}</div>`);
     sections.push(this._expandedHtml());
     if (!cfg.compact && cfg.show_alerts) sections.push(this._alertHtml());
+    // Action feedback shows regardless of compact/show_alerts: it's the only
+    // sign a tap failed.
+    if (this._errorMsg) {
+      sections.push(
+        `<div class="banner banner-error" data-action="dismiss-error" role="alert">${esc(this._errorMsg)}</div>`,
+      );
+    }
     return `<div class="card-wrap">${sections.join("")}</div>`;
   }
 
   // ---- change detection ---------------------------------------------------
 
-  // Only the entities this card actually references matter for a re-render;
-  // comparing their state *objects* by reference (HA replaces the object on
-  // every state change) avoids rebuilding the DOM on unrelated bus noise.
-  _relevantStates() {
-    if (!this._entities) return [];
-    // Filter on entity *presence* (fixed once discovery finishes), not on
-    // state presence — the array must stay stable-length/stable-order for
-    // the reference comparison in `_shouldRender` to mean anything.
-    return KEYS_RENDERED.map((k) => this._entities[k])
-      .filter(Boolean)
-      .map((id) => this._hass.states[id]);
+  // A signature of exactly what a render reads: config, discovery status, and
+  // per referenced entity its state string plus the few attributes in
+  // ATTRS_RENDERED. Comparing state *objects* by reference (the old check)
+  // rebuilt the DOM on attribute-only updates the card never displays — the
+  // cooking detector's score/per-sensor payload changes on every kitchen
+  // sensor event.
+  _renderSig() {
+    const parts = [
+      this._configSig,
+      this._mapVersion,
+      this._entities === null ? "pending" : this._deviceStatus,
+      this._discoverFailures > 0 ? "failing" : "",
+    ];
+    if (this._entities) {
+      for (const key of KEYS_RENDERED) {
+        const id = this._entities[key];
+        if (!id) continue;
+        const st = this._hass.states[id];
+        if (!st) {
+          parts.push(key, "");
+          continue;
+        }
+        parts.push(key, st.state);
+        const attrs = st.attributes || {};
+        for (const name of ATTRS_RENDERED) {
+          if (attrs[name] !== undefined) parts.push(name, attrs[name]);
+        }
+      }
+    }
+    return parts.join("\u0001");
   }
 
   _shouldRender() {
-    const states = this._relevantStates();
-    const configSig = JSON.stringify(this._config);
-    const entitiesReady = this._entities !== null;
-    const changed =
-      configSig !== this._lastConfigSig ||
-      entitiesReady !== this._lastEntitiesReady ||
-      !this._lastStates ||
-      states.length !== this._lastStates.length ||
-      states.some((s, i) => s !== this._lastStates[i]);
-    this._lastConfigSig = configSig;
-    this._lastEntitiesReady = entitiesReady;
-    this._lastStates = states;
+    const sig = this._renderSig();
+    const changed = sig !== this._lastSig;
+    this._lastSig = sig;
     return changed;
   }
 
@@ -885,19 +1117,66 @@ class ParmairCard extends HTMLElement {
     }
     if (this._forceNextRender) {
       this._forceNextRender = false;
+      this._lastSig = this._renderSig();
     } else if (!this._shouldRender()) {
       return;
     }
-    this._card.innerHTML = this._bodyHtml();
+    this._flowNext = null;
+    const html = this._bodyHtml();
+    // A changed signature doesn't always change the markup (e.g. a state the
+    // card only formats to the same rounded value); skipping the write keeps
+    // the DOM, focus and running animations intact.
+    if (html === this._lastHtml) return;
+    this._lastHtml = html;
+    this._card.innerHTML = html;
+    if (this._flowNext) {
+      const wrap = this._card.querySelector(".airflow-wrap");
+      if (wrap) {
+        wrap.style.setProperty(
+          "--flow-delay",
+          this._flowDelay(this._flowNext.running, this._flowNext.duration),
+        );
+      }
+    }
   }
 
   disconnectedCallback() {
+    // Read by the discovery schedulers: a request still in flight must not
+    // arm a new timer once it settles.
+    this._detached = true;
     clearTimeout(this._pwrRevertTimer);
+    this._pwrRevertTimer = null;
+    // Clear the pending "Turn off?" too: its timer (the only thing that would
+    // expire it on screen) is gone, and re-arming a half-confirmed power-off
+    // on reattach would be a surprise.
+    this._pwrConfirmUntil = null;
+    clearTimeout(this._errorTimer);
+    this._errorTimer = null;
+    this._errorMsg = null;
+    // Pending discovery timers would otherwise keep firing for a card that
+    // was removed for good; remember them and pick up again on reattach.
+    if (this._rediscoverTimer || this._retryTimer) this._needsRediscover = true;
+    clearTimeout(this._rediscoverTimer);
+    this._rediscoverTimer = null;
+    clearTimeout(this._retryTimer);
+    this._retryTimer = null;
     if (this._resizeObserver) this._resizeObserver.disconnect();
   }
 
   connectedCallback() {
+    this._detached = false;
     if (this._resizeObserver && this._card) this._resizeObserver.observe(this._card);
+    if (this._needsRediscover) {
+      this._needsRediscover = false;
+      if (this._entities === null) this._maybeDiscover();
+      else this._scheduleRediscover();
+    }
+    if (this._card) {
+      // Re-attaching restarts CSS animations and the DOM may show a state
+      // cleared above; force one full rewrite.
+      this._lastHtml = null;
+      this._forceRender();
+    }
   }
 
   // Interaction-driven UI state (the power confirmation, the expanded
@@ -911,8 +1190,31 @@ class ParmairCard extends HTMLElement {
 
   // ---- interaction ----------------------------------------------------
 
+  // The service promise used to be dropped: a failed write (unit offline)
+  // became an unhandled rejection and the tap just seemed to do nothing.
   _callService(domain, service, data) {
-    this._hass.callService(domain, service, data);
+    let result;
+    try {
+      result = this._hass.callService(domain, service, data);
+    } catch (err) {
+      this._showError(err);
+      return;
+    }
+    if (result && typeof result.catch === "function") {
+      result.catch((err) => this._showError(err));
+    }
+  }
+
+  _showError(err) {
+    const detail = err && (err.message || (err.error && err.error.message));
+    this._errorMsg = detail ? `Action failed: ${detail}` : "Action failed";
+    clearTimeout(this._errorTimer);
+    this._errorTimer = setTimeout(() => {
+      this._errorTimer = null;
+      this._errorMsg = null;
+      this._forceRender();
+    }, ERROR_VISIBLE_MS);
+    this._forceRender();
   }
 
   _fireMoreInfo(entityId) {
@@ -955,7 +1257,10 @@ class ParmairCard extends HTMLElement {
     const step = Number(el.dataset.step);
     if ([dir, min, max, step].some(Number.isNaN)) return null;
     const base = current == null ? (dir > 0 ? min - step : max + step) : current;
-    const next = Math.max(min, Math.min(max, base + dir * step));
+    // Entity-reported steps can be fractional (0.1, 0.5): trim the binary
+    // float noise (21.599999…) to the step's own precision before sending.
+    const decimals = (String(step).split(".")[1] || "").length;
+    const next = Number(Math.max(min, Math.min(max, base + dir * step)).toFixed(decimals));
     return next === current ? null : next;
   }
 
@@ -988,8 +1293,23 @@ class ParmairCard extends HTMLElement {
       this._onPowerClick();
       return;
     }
+    if (action === "dismiss-error") {
+      clearTimeout(this._errorTimer);
+      this._errorTimer = null;
+      this._errorMsg = null;
+      this._forceRender();
+      return;
+    }
     if (action === "preset-auto") {
-      if (fanId) this._callService("fan", "set_preset_mode", { entity_id: fanId, preset_mode: "home" });
+      // Only meaningful from manual speed: a preset is already in charge
+      // otherwise, and forcing "home" would silently cancel Away, Boost or
+      // Fireplace. Leaving manual restores home or away from the home-state
+      // sensor, like the integration's own restore_control_state; with no
+      // reading at all, home is the neutral default.
+      if (!fanId || this._raw("control_state") !== "manual") return;
+      const home = this._raw("home");
+      const preset = home === "off" ? "away" : "home";
+      this._callService("fan", "set_preset_mode", { entity_id: fanId, preset_mode: preset });
       return;
     }
     if (action === "speed-step") {
@@ -1039,15 +1359,20 @@ class ParmairCard extends HTMLElement {
  * UI editor
  * ------------------------------------------------------------------ */
 
+// The form's schema never changes and its data only changes with the config,
+// so they're assigned once / on setConfig respectively. Reassigning both on
+// every hass tick (the old behavior) re-rendered the whole ha-form several
+// times a second while the editor was open; only `hass` is forwarded per tick
+// (the device selector needs it).
 class ParmairCardEditor extends HTMLElement {
   setConfig(config) {
     this._config = { ...(config || {}) };
-    this._render();
+    if (!this._ensureForm()) this._form.data = this._formData();
   }
 
   set hass(hass) {
     this._hass = hass;
-    this._render();
+    if (!this._ensureForm()) this._form.hass = hass;
   }
 
   _schema() {
@@ -1087,31 +1412,38 @@ class ParmairCardEditor extends HTMLElement {
     return true;
   }
 
-  _render() {
-    if (!this._hass || !this._config) return;
-    if (!this._form) {
-      this._form = document.createElement("ha-form");
-      this.appendChild(this._form);
-      this._form.computeLabel = (s) => this._labels()[s.name] || s.name;
-      this._form.addEventListener("value-changed", (ev) => {
-        ev.stopPropagation();
-        const next = { ...ev.detail.value };
-        if (JSON.stringify(next) === JSON.stringify(this._config)) return;
-        this._config = next;
-        this.dispatchEvent(
-          new CustomEvent("config-changed", { detail: { config: next }, bubbles: true, composed: true }),
-        );
-      });
-    }
-    this._form.hass = this._hass;
-    this._form.schema = this._schema();
-    this._form.data = {
+  _formData() {
+    return {
       show_airflow: this._defaultAirflow(),
       show_metrics: this._defaultMetrics(),
       show_alerts: this._config.show_alerts !== false,
       compact: this._config.compact === true,
       ...this._config,
     };
+  }
+
+  // Builds the form once both hass and config exist (setting hass, schema and
+  // data itself). Returns false only when the form already existed — i.e.
+  // when the caller still has to push its own update into it.
+  _ensureForm() {
+    if (this._form) return false;
+    if (!this._hass || !this._config) return true;
+    this._form = document.createElement("ha-form");
+    this._form.computeLabel = (s) => this._labels()[s.name] || s.name;
+    this._form.addEventListener("value-changed", (ev) => {
+      ev.stopPropagation();
+      const next = { ...ev.detail.value };
+      if (JSON.stringify(next) === JSON.stringify(this._config)) return;
+      this._config = next;
+      this.dispatchEvent(
+        new CustomEvent("config-changed", { detail: { config: next }, bubbles: true, composed: true }),
+      );
+    });
+    this._form.hass = this._hass;
+    this._form.schema = this._schema();
+    this._form.data = this._formData();
+    this.appendChild(this._form);
+    return true;
   }
 }
 

@@ -8,6 +8,7 @@ replays a real VOC-index trace captured from the kitchen sensor on 2026-07-18.
 from __future__ import annotations
 
 import importlib.util
+import math
 import pathlib
 import sys
 from datetime import datetime, timedelta
@@ -517,3 +518,78 @@ def test_tick_with_no_samples_is_inactive():
     r2 = empty.tick(T0, DEFAULTS)
     assert r2.score == 0.0
     assert not r2.active
+
+
+# --------------------------------------------------------------------------- #
+# Onset arming across a stale gap
+# --------------------------------------------------------------------------- #
+
+
+def test_arming_does_not_survive_a_stale_gap():
+    """Regression: spike, 100 s of silence, spike used to turn ON instantly.
+
+    Arming requires the score to hold continuously, but the state machine only
+    runs on a sample (the heartbeat exists only while active), so the
+    100-s-old arm timestamp made the second spike look like a 100 s hold.
+    """
+    det = _voc_detector()
+    t, _ = _feed(det, VOC, T0, [80] * 80)
+
+    first = det.update(t + _sec(2.0), VOC, 120.0, DEFAULTS)
+    assert first.transition is None  # armed, not yet persisted
+
+    second = det.update(t + _sec(102.0), VOC, 120.0, DEFAULTS)
+    assert second.transition is None
+    assert not det.active
+
+    # A genuine hold from the second spike still turns it on.
+    third = det.update(t + _sec(106.0), VOC, 122.0, DEFAULTS)
+    assert third.transition is True
+
+
+def test_arming_survives_a_gap_shorter_than_stale():
+    """The expiry is about stale evidence, not about any gap between samples."""
+    det = _voc_detector()
+    t, _ = _feed(det, VOC, T0, [80] * 80)
+    det.update(t + _sec(2.0), VOC, 120.0, DEFAULTS)
+    r = det.update(t + _sec(12.0), VOC, 120.0, DEFAULTS)
+    assert r.transition is True
+
+
+# --------------------------------------------------------------------------- #
+# Non-finite values and restore hygiene
+# --------------------------------------------------------------------------- #
+
+
+def test_non_finite_sample_is_treated_as_unavailable():
+    det = _voc_detector()
+    t, _ = _feed(det, VOC, T0, [80] * 80)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        det.update(t + _sec(2.0), VOC, bad, DEFAULTS)
+        diag = det.diagnostics(t + _sec(2.0))[VOC]
+        assert diag["status"] == "unavailable"
+        assert math.isfinite(diag["baseline"])  # baseline not poisoned
+
+
+def test_restore_rejects_non_finite_or_malformed_baselines():
+    det = _voc_detector()
+    now = T0
+    det.restore(
+        {"sensors": {VOC: {"mu": float("nan"), "dev": 2.0, "n": 30, "saved_at": now.timestamp()}}},
+        now,
+    )
+    assert det.diagnostics(now)[VOC]["baseline"] is None
+    det.restore({"sensors": {VOC: {"mu": "garbage", "dev": 2.0, "saved_at": now.timestamp()}}}, now)
+    det.restore({"sensors": {VOC: {"dev": 2.0, "saved_at": now.timestamp()}}}, now)
+    assert det.diagnostics(now)[VOC]["baseline"] is None
+
+
+def test_restore_skips_sensors_no_longer_configured():
+    """A sensor removed from the options must not be resurrected from storage."""
+    det = _voc_detector()
+    det.restore(
+        {"sensors": {HUM: {"mu": 40.0, "dev": 1.0, "n": 30, "saved_at": T0.timestamp()}}},
+        T0,
+    )
+    assert HUM not in det.diagnostics(T0)
+    assert HUM not in det.snapshot(T0)["sensors"]

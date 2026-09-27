@@ -13,6 +13,7 @@ physically adding a sensor) without deleting and re-adding the integration.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,10 +21,10 @@ import voluptuous as vol
 from homeassistant.components.modbus import async_get_temporary_unit
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import selector
-from modbus_connection import ModbusUnit
+from modbus_connection import ModbusError, ModbusUnit
 
 from . import modbus
 from .capabilities import (
@@ -49,6 +50,8 @@ from .const import (
 )
 from .modbus import ParmairConnectionError
 from .registers import DEFAULT_MAP, MAP_V1_87, build_read_plan, decode
+
+_LOGGER = logging.getLogger(__name__)
 
 # Static registers that drive capability detection (heater/recovery/M10-M12
 # wiring + firmware/software versions).
@@ -136,6 +139,32 @@ async def async_probe_device(unit: ModbusUnit) -> ProbeResult:
         await client.close()
 
     return ProbeResult(capabilities=capabilities, register_map=DEFAULT_MAP)
+
+
+async def _async_probe_endpoint(hass: HomeAssistant, host: str, port: int) -> ProbeResult:
+    """Borrow a temporary unit for ``host:port`` and probe it.
+
+    Leaving the borrow closes the connection when the probe opened it, and that
+    close can raise a raw ``modbus_connection`` error (``ModbusConnectionError``
+    when tearing the socket down fails) that nothing below translates. After a
+    successful probe it is only a failed teardown — the link is dropped
+    regardless — so the result stands; otherwise it is a connection failure.
+
+    Raises :class:`~.modbus.ParmairConnectionError`, :class:`NotParmairError`,
+    or ``HomeAssistantError`` (the endpoint is held with other link settings).
+    """
+    probe: ProbeResult | None = None
+    try:
+        async with async_get_temporary_unit(
+            hass, modbus.tcp_params(host, port), modbus.UNIT_ID_DEFAULT
+        ) as unit:
+            probe = await async_probe_device(unit)
+    except ModbusError as err:
+        if probe is None:
+            raise ParmairConnectionError(f"releasing the probe connection failed: {err}") from err
+        _LOGGER.debug("Parmair probe connection teardown failed (ignored): %s", err)
+    assert probe is not None
+    return probe
 
 
 def _features_summary(capabilities: Capabilities) -> str:
@@ -238,10 +267,7 @@ class ParmairConfigFlow(ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(f"{host}:{port}")
             self._abort_if_unique_id_configured()
             try:
-                async with async_get_temporary_unit(
-                    self.hass, modbus.tcp_params(host, port), modbus.UNIT_ID_DEFAULT
-                ) as unit:
-                    probe = await async_probe_device(unit)
+                probe = await _async_probe_endpoint(self.hass, host, port)
             except NotParmairError:
                 errors["base"] = "not_parmair"
             except ParmairConnectionError, HomeAssistantError:
@@ -300,49 +326,55 @@ class ParmairConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class ParmairOptionsFlow(OptionsFlow):
-    """Options flow: polling/calibration tuning, plus an on-demand redetect."""
+    """Options flow: polling/calibration tuning, plus an on-demand redetect.
+
+    Not ``OptionsFlowWithReload``: that refuses entries with update listeners,
+    and ours also reloads on programmatic option/data changes. Instead a
+    redetect that changes the capabilities writes data *and* options in one
+    update (one listener call, one reload); the options write that follows
+    from ``async_create_entry`` is then a no-op and reloads nothing.
+    """
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Show/save the options form; optionally re-probe the unit first."""
         errors: dict[str, str] = {}
         if user_input is not None:
+            options: dict[str, Any] = {
+                CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL]),
+                CONF_CO2_OFFSET: int(user_input[CONF_CO2_OFFSET]),
+            }
+            summer_auto_source = user_input.get(CONF_SUMMER_AUTO_SOURCE)
+            if summer_auto_source:
+                options[CONF_SUMMER_AUTO_SOURCE] = summer_auto_source
+            cooking_sensors = user_input.get(CONF_COOKING_SENSORS)
+            if cooking_sensors:
+                options[CONF_COOKING_SENSORS] = cooking_sensors
+
             if user_input.get(CONF_REDETECT):
                 try:
                     # A temporary hold shares the connection the live entry
                     # already holds, so the probe rides the coordinator's
                     # socket rather than opening a second client to the same
                     # controller (which corrupts both), and releases cleanly.
-                    async with async_get_temporary_unit(
+                    probe = await _async_probe_endpoint(
                         self.hass,
-                        modbus.tcp_params(
-                            self.config_entry.data[CONF_HOST],
-                            int(self.config_entry.data[CONF_PORT]),
-                        ),
-                        modbus.UNIT_ID_DEFAULT,
-                    ) as unit:
-                        probe = await async_probe_device(unit)
-                except ParmairConnectionError, NotParmairError, HomeAssistantError:
+                        self.config_entry.data[CONF_HOST],
+                        int(self.config_entry.data[CONF_PORT]),
+                    )
+                except NotParmairError:
+                    errors["base"] = "not_parmair"
+                except ParmairConnectionError, HomeAssistantError:
                     errors["base"] = "cannot_connect"
                 else:
-                    self.hass.config_entries.async_update_entry(
-                        self.config_entry,
-                        data={
-                            **self.config_entry.data,
-                            CONF_CAPABILITIES: probe.capabilities.as_dict(),
-                        },
-                    )
+                    capabilities = probe.capabilities.as_dict()
+                    if capabilities != self.config_entry.data.get(CONF_CAPABILITIES):
+                        self.hass.config_entries.async_update_entry(
+                            self.config_entry,
+                            data={**self.config_entry.data, CONF_CAPABILITIES: capabilities},
+                            options=options,
+                        )
 
             if not errors:
-                options = {
-                    CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL]),
-                    CONF_CO2_OFFSET: int(user_input[CONF_CO2_OFFSET]),
-                }
-                summer_auto_source = user_input.get(CONF_SUMMER_AUTO_SOURCE)
-                if summer_auto_source:
-                    options[CONF_SUMMER_AUTO_SOURCE] = summer_auto_source
-                cooking_sensors = user_input.get(CONF_COOKING_SENSORS)
-                if cooking_sensors:
-                    options[CONF_COOKING_SENSORS] = cooking_sensors
                 return self.async_create_entry(data=options)
 
         return self.async_show_form(

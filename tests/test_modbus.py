@@ -20,8 +20,11 @@ import asyncio
 import pytest
 from modbus_connection import (
     IllegalDataAddressError,
+    IllegalDataValueError,
+    IllegalFunctionError,
     ModbusConnectionError,
     ModbusDesyncError,
+    ServerDeviceBusyError,
 )
 from modbus_connection.mock import MockModbusConnection, MockModbusUnit
 
@@ -68,7 +71,7 @@ def reads(unit: MockModbusUnit) -> list[tuple[int, int]]:
 
 
 def test_construction_sets_the_inter_transaction_spacing(client, unit):
-    """Pacing is delegated to the shared connection, which enforces it bus-wide."""
+    """Pacing is delegated to the library — per unit id, not connection-wide."""
     assert unit.message_spacing == modbus.INTER_TRANSACTION_DELAY
 
 
@@ -140,6 +143,51 @@ async def test_io_after_close_is_refused(client, unit):
     await client.close()
     with pytest.raises(ParmairConnectionError, match="after release"):
         await client.read_block(1200, 2)
+
+
+async def test_io_after_close_fails_fast_and_never_disconnects(client, unit):
+    """Regression: a released client used to retry, and each retry disconnected.
+
+    The refusal went through the retry loop, whose retry-time ``_drop_link``
+    then called ``unit.disconnect()`` on a *shared* connection we had already
+    given up — tearing it down under every other holder.
+    """
+    await client.connect()
+    await client.close()
+    unit.read_events.clear()
+
+    for attempt in (client.read_block(1200, 1), client.write_register(1187, 3), client.connect()):
+        with pytest.raises(modbus.ParmairClientReleasedError):
+            await attempt
+
+    assert unit.connected is True
+    assert unit.read_events == []
+    assert 1187 not in unit.holding
+
+
+async def test_close_is_idempotent(client, unit):
+    await client.connect()
+    await client.close()
+    await client.close()
+    assert unit.connected is True
+
+
+async def test_release_mid_transaction_stops_retrying_without_disconnecting(client, unit):
+    """A close that lands while a transaction is failing must end it, not drop the link."""
+    await client.connect()
+    original = unit.read_holding_registers
+
+    async def fail_and_release(address: int, count: int) -> list[int]:
+        if address == 1200:
+            await client.close()
+            raise ModbusConnectionError("link wedged")
+        return await original(address, count)
+
+    unit.read_holding_registers = fail_and_release
+
+    with pytest.raises(modbus.ParmairClientReleasedError):
+        await client.read_block(1200, 1)
+    assert unit.connected is True
 
 
 # ── reads ────────────────────────────────────────────────────────────────
@@ -214,6 +262,24 @@ async def test_a_link_that_cannot_be_warmed_up_short_circuits_the_read(client, u
     assert [r for r in reads(unit) if r == (1200, 1)] == [(1200, 1)]
 
 
+async def test_an_unreachable_unit_flags_the_final_error(client, unit):
+    """Failing at the warm-up is the "unit is gone" signature the poll fast-fails on."""
+    await client.connect()
+    unit.fail_requests(ModbusConnectionError("unit is down"))
+    with pytest.raises(ParmairConnectionError) as excinfo:
+        await client.read_block(1200, 1)
+    assert excinfo.value.link_unreachable is True
+
+
+async def test_a_failing_block_on_a_live_link_is_not_flagged_unreachable(client, unit):
+    """The unit answers the warm-up every time; only this block fails."""
+    await client.connect()
+    unit.fail_read(1200, ModbusConnectionError("gone"))
+    with pytest.raises(ParmairConnectionError) as excinfo:
+        await client.read_block(1200, 1)
+    assert excinfo.value.link_unreachable is False
+
+
 async def test_a_wedged_link_is_dropped_after_the_last_attempt(client, unit):
     """Giving up must not hand the next transaction a link known to be broken."""
     await client.connect()
@@ -232,6 +298,30 @@ async def test_error_response_is_translated_and_flagged(client, unit):
     with pytest.raises(ParmairConnectionError, match="rejected") as excinfo:
         await client.read_block(1200, 1)
     assert excinfo.value.device_answered is True
+
+
+@pytest.mark.parametrize(
+    "rejection", [IllegalFunctionError, IllegalDataAddressError, IllegalDataValueError]
+)
+async def test_deterministic_rejection_is_not_retried(client, unit, rejection):
+    """Codes 1-3 say the request itself is wrong; asking again gets the same answer."""
+    await client.connect()
+    unit.fail_read(1200, rejection())
+    with pytest.raises(ParmairConnectionError, match="rejected") as excinfo:
+        await client.read_block(1200, 1)
+    assert excinfo.value.deterministic is True
+    assert [r for r in reads(unit) if r == (1200, 1)] == [(1200, 1)]
+
+
+async def test_a_transient_error_response_is_still_retried(client, unit):
+    """Busy is the device's own condition, which can clear between attempts."""
+    await client.connect()
+    unit.fail_read(1200, ServerDeviceBusyError())
+    with pytest.raises(ParmairConnectionError, match="rejected") as excinfo:
+        await client.read_block(1200, 1)
+    assert excinfo.value.deterministic is False
+    assert len([r for r in reads(unit) if r == (1200, 1)]) == modbus.MAX_ATTEMPTS
+    assert unit.connected is True  # the device answered, so the link is kept
 
 
 async def test_error_response_does_not_drop_the_shared_link(client, unit):

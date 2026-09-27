@@ -166,3 +166,39 @@ async def test_setup_registration_is_idempotent_across_reloads(
     items = lovelace_data.resources.async_items()
     matches = [item for item in items if str(item["url"]).startswith(base_url)]
     assert len(matches) == 1
+
+
+async def test_failed_resource_step_is_retried_on_reload_without_a_duplicate_route(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    """Regression: one flag covered both steps, so after the resource step raised
+    a reload re-added the static route, aiohttp rejected the duplicate, and the
+    resource was never registered for the rest of the process."""
+    from unittest.mock import patch
+
+    from conftest import FakeModbusClient
+    from homeassistant.components.lovelace.const import LOVELACE_DATA
+
+    assert await async_setup_component(hass, "http", {})
+    assert await async_setup_component(hass, "lovelace", {"lovelace": {"mode": "storage"}})
+    await hass.async_block_till_done()
+
+    with patch(
+        "custom_components.parmair._async_register_resource",
+        side_effect=RuntimeError("resource registry not ready"),
+    ):
+        entry, _fake_client = await async_setup_integration(rexo120_bank)
+    assert hass.data.get(f"{DOMAIN}_card") is not True
+    assert hass.data.get(f"{DOMAIN}_card_route") is True
+
+    with patch(
+        "custom_components.parmair.modbus.create_client",
+        return_value=FakeModbusClient(rexo120_bank),
+    ):
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert hass.data.get(f"{DOMAIN}_card") is True
+    base_url = f"{CARD_URL_BASE}/{CARD_FILENAME}"
+    items = hass.data[LOVELACE_DATA].resources.async_items()
+    assert len([item for item in items if str(item["url"]).startswith(base_url)]) == 1

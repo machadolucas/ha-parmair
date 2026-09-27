@@ -162,3 +162,81 @@ async def test_summer_auto_source_entity_overrides_fresh_air_temperature(
     await hass.async_block_till_done()
 
     assert (1079, 1) in fake_client.writes
+
+
+async def _setup_with_source(
+    hass: HomeAssistant, bank: dict[int, int], capabilities: dict[str, Any]
+) -> tuple[MockConfigEntry, FakeModbusClient]:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "192.168.101.56",
+            CONF_PORT: 502,
+            CONF_REGISTER_MAP: "v1_87",
+            CONF_CAPABILITIES: capabilities,
+        },
+        options={CONF_SCAN_INTERVAL: 10, CONF_SUMMER_AUTO_SOURCE: "sensor.test_outdoor"},
+        title="Parmair",
+    )
+    fake_client = FakeModbusClient(bank)
+    with patch("custom_components.parmair.modbus.create_client", return_value=fake_client):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    return entry, fake_client
+
+
+async def test_fahrenheit_source_is_converted_before_the_celsius_thresholds(
+    hass: HomeAssistant,
+    rexo120_bank: dict[int, int],
+    rexo120_capabilities_dict: dict[str, Any],
+    freezer,
+) -> None:
+    """59 °F is 15 °C: under the 20 °C on-threshold, though 59 is far over it."""
+    rexo120_bank[1079] = 0  # summer_mode off
+    entry, fake_client = await _setup_with_source(hass, rexo120_bank, rexo120_capabilities_dict)
+    hass.states.async_set("sensor.test_outdoor", "59", {"unit_of_measurement": "°F"})
+    await _enable_summer_auto(hass, entry.entry_id, on_min=1, off_min=1)
+
+    await entry.runtime_data.async_refresh()
+    freezer.tick(timedelta(minutes=2))
+    await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+    assert (1079, 1) not in fake_client.writes
+
+    hass.states.async_set("sensor.test_outdoor", "298.15", {"unit_of_measurement": "K"})
+    await entry.runtime_data.async_refresh()  # 25 °C: arms the on-dwell
+    freezer.tick(timedelta(minutes=2))
+    await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+    assert (1079, 1) in fake_client.writes
+
+
+async def test_failed_fresh_air_block_is_no_evidence_to_act_on(
+    hass: HomeAssistant,
+    async_setup_integration,
+    rexo120_bank: dict[int, int],
+    freezer,
+) -> None:
+    """A retained (stale) fresh-air value must not complete the dwell.
+
+    The tick is skipped rather than fed ``None``: None resets the dwell timers,
+    which one routine flaky block would then do to a 60-120 min dwell.
+    """
+    rexo120_bank[1079] = 0  # summer_mode off; fresh air reads 25.4
+    entry, fake_client = await async_setup_integration(rexo120_bank)
+    coordinator = entry.runtime_data
+    await _enable_summer_auto(hass, entry.entry_id, on_min=1, off_min=1)
+
+    await coordinator.async_refresh()  # arms the on-dwell timer
+    fresh_air_block = coordinator._find_block("fresh_air_temperature").address
+    fake_client.fail_reads_at = {fresh_air_block}
+    freezer.tick(timedelta(minutes=2))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert (1079, 1) not in fake_client.writes
+
+    fake_client.fail_reads_at = set()
+    await coordinator.async_refresh()  # fresh evidence; the dwell kept running
+    await hass.async_block_till_done()
+    assert (1079, 1) in fake_client.writes

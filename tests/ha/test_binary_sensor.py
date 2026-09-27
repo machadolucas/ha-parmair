@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+from typing import Any
+from unittest.mock import patch
+
+from conftest import FakeModbusClient
+from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.parmair.const import DOMAIN
+from custom_components.parmair.binary_sensor import ParmairCookingDetectedBinarySensor
+from custom_components.parmair.const import (
+    CONF_CAPABILITIES,
+    CONF_COOKING_SENSORS,
+    CONF_REGISTER_MAP,
+    CONF_SCAN_INTERVAL,
+    DOMAIN,
+    SIGNAL_COOKING_UPDATE,
+)
 
 
 def _entity_id(hass: HomeAssistant, entry: MockConfigEntry, key: str) -> str | None:
@@ -104,3 +119,54 @@ async def test_diagnostic_disabled_by_default_entities_exist_but_disabled(
         entry_reg = registry.entities[entity_id]
         assert entry_reg.disabled_by == er.RegistryEntryDisabler.INTEGRATION
         assert hass.states.get(entity_id) is None  # disabled entities carry no state
+
+
+async def test_cooking_detected_skips_poll_rewrites_and_volatile_attributes(
+    hass: HomeAssistant,
+    rexo120_bank: dict[int, int],
+    rexo120_capabilities_dict: dict[str, Any],
+    freezer,
+) -> None:
+    """``cooking_detected`` carries a large, fast-changing attribute payload; it must
+    neither be rewritten on every Modbus poll nor have that payload recorded."""
+    assert {"score", "sensors"} <= ParmairCookingDetectedBinarySensor._unrecorded_attributes
+    assert "threshold" not in ParmairCookingDetectedBinarySensor._unrecorded_attributes
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "192.168.101.56",
+            CONF_PORT: 502,
+            CONF_REGISTER_MAP: "v1_87",
+            CONF_CAPABILITIES: rexo120_capabilities_dict,
+        },
+        options={CONF_SCAN_INTERVAL: 10, CONF_COOKING_SENSORS: ["sensor.test_voc"]},
+        title="Parmair",
+    )
+    fake_client = FakeModbusClient(rexo120_bank)
+    with patch("custom_components.parmair.modbus.create_client", return_value=fake_client):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    coordinator = entry.runtime_data
+    entity_id = _entity_id(hass, entry, "cooking_detected")
+    before = hass.states.get(entity_id)
+    # HA mutates ``last_reported`` on the live State object, so snapshot it.
+    reported = before.last_reported
+    assert before.state == "off"
+
+    freezer.tick(timedelta(seconds=30))
+    fake_client.bank[1201] = 1  # a poll that changes other entities' data
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).last_reported == reported
+
+    fake_client.fail_all = True
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == "off"  # not "unavailable"
+
+    freezer.tick(timedelta(seconds=30))
+    async_dispatcher_send(hass, SIGNAL_COOKING_UPDATE.format(entry.entry_id))
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).last_reported > reported

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
 from custom_components.parmair.const import DOMAIN
@@ -75,3 +77,20 @@ async def test_unknown_raw_value_reports_no_current_option(
     await hass.async_block_till_done()
 
     assert hass.states.get(entity_id).state is None or hass.states.get(entity_id).state == "unknown"
+
+
+async def test_write_failure_raises_translated_error(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    entry, fake_client = await async_setup_integration(rexo120_bank)
+    fake_client.fail_writes = True
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await hass.services.async_call(
+            "select",
+            "select_option",
+            {"entity_id": _entity_id(hass, entry.entry_id, "boost_duration"), "option": "60"},
+            blocking=True,
+        )
+
+    assert exc_info.value.translation_key == "write_failed"

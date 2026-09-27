@@ -20,14 +20,12 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntityDescription,
 )
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .const import SIGNAL_COOKING_UPDATE
 from .coordinator import ParmairConfigEntry, ParmairCoordinator
-from .entity import ParmairEntity
+from .entity import ParmairCookingEntity, ParmairEntity
 from .registers import REGISTER_MAPS
 
 
@@ -125,29 +123,23 @@ class ParmairBinarySensor(ParmairEntity, BinarySensorEntity):
         return value == 1
 
 
-class ParmairCookingDetectedBinarySensor(ParmairEntity, BinarySensorEntity):
+class ParmairCookingDetectedBinarySensor(ParmairCookingEntity, BinarySensorEntity):
     """Whether the adaptive multi-sensor cooking detector currently holds a detection.
 
     Purely dispatcher-driven (see ``coordinator.async_setup_cooking``/
-    ``_handle_cooking_result``): the detector runs off kitchen source-sensor
-    state-change events, never the Modbus poll cycle, so unlike every other
-    entity here ``available`` is NOT allowed to fall back to
-    ``coordinator.last_update_success`` (the ``_requires_register = False``
-    default in :class:`~.entity.ParmairEntity`) — a stalled/failing Modbus
-    poll must not blank out a cooking detection that keeps computing fine
-    from its own independent event stream. It's simply available whenever the
-    entry is loaded.
+    ``_handle_cooking_result``); availability and update semantics come from
+    :class:`~.entity.ParmairCookingEntity`.
     """
 
     _attr_device_class = BinarySensorDeviceClass.RUNNING
-    _requires_register = False
+    # ``score`` and the per-sensor dict change on nearly every kitchen-sensor
+    # event; recording them would write a fresh attributes row per event (the
+    # score has its own recorded sensor anyway). ``threshold`` only moves with
+    # the sensitivity setting, so it stays in history as context.
+    _unrecorded_attributes = frozenset({"score", "sensors"})
 
     def __init__(self, coordinator: ParmairCoordinator) -> None:
         super().__init__(coordinator, "cooking_detected")
-
-    @property
-    def available(self) -> bool:
-        return True
 
     @property
     def is_on(self) -> bool:
@@ -164,20 +156,6 @@ class ParmairCookingDetectedBinarySensor(ParmairEntity, BinarySensorEntity):
             "threshold": round(threshold, 2),
             "sensors": sensors,
         }
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                SIGNAL_COOKING_UPDATE.format(self.coordinator.config_entry.entry_id),
-                self._handle_cooking_update,
-            )
-        )
-
-    @callback
-    def _handle_cooking_update(self) -> None:
-        self.async_write_ha_state()
 
 
 async def async_setup_entry(

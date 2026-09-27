@@ -11,6 +11,7 @@ from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import HomeAssistantError
+from modbus_connection import ModbusConnectionError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.parmair.const import (
@@ -339,3 +340,121 @@ async def test_probe_reports_a_borrow_conflict_as_cannot_connect(
 
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "cannot_connect"}
+
+
+# ── Probe teardown, redetect reloads and errors ───────────────────────────────
+
+
+def _temporary_unit_failing_on_release():
+    """A borrow whose exit raises the raw error closing a probe-opened link can."""
+
+    @asynccontextmanager
+    async def temporary_unit(*_args, **_kwargs):
+        yield MagicMock()
+        raise ModbusConnectionError("could not tear the link down")
+
+    return temporary_unit
+
+
+async def test_failed_teardown_after_a_good_probe_still_confirms(
+    hass: HomeAssistant, rexo120_bank: dict[int, int]
+) -> None:
+    """Regression: the raw ModbusError from releasing the unit escaped the flow."""
+    with patch(
+        "custom_components.parmair.config_flow.async_get_temporary_unit",
+        _temporary_unit_failing_on_release(),
+    ):
+        result, _fake_client = await _start_and_probe(hass, rexo120_bank)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "confirm"
+
+
+async def test_failed_teardown_after_a_failed_probe_is_cannot_connect(
+    hass: HomeAssistant, rexo120_bank: dict[int, int]
+) -> None:
+    fake_client = FakeModbusClient(rexo120_bank)
+    fake_client.fail_connect = True
+    with (
+        patch(
+            "custom_components.parmair.config_flow.async_get_temporary_unit",
+            _temporary_unit_failing_on_release(),
+        ),
+        patch("custom_components.parmair.modbus.create_client", return_value=fake_client),
+    ):
+        result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], _USER_INPUT)
+
+    assert result["errors"] == {"base": "cannot_connect"}
+
+
+async def _redetect(
+    hass: HomeAssistant, entry: MockConfigEntry, bank: dict[int, int], scan_interval: int
+) -> dict:
+    with patch(
+        "custom_components.parmair.modbus.create_client", return_value=FakeModbusClient(bank)
+    ):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {CONF_SCAN_INTERVAL: scan_interval, CONF_CO2_OFFSET: -480, CONF_REDETECT: True},
+        )
+        await hass.async_block_till_done()
+    return result
+
+
+async def test_redetect_with_changed_capabilities_and_options_reloads_once(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    """Data and options used to be written separately: two listener calls, two reloads."""
+    entry, _client = await async_setup_integration(rexo120_bank)
+    new_bank = dict(rexo120_bank)
+    new_bank[1242] = 2  # m10_sensor_type -> humidity
+    new_bank[1030] = 500  # wet_room_humidity now reads present
+
+    with patch.object(
+        hass.config_entries, "async_reload", wraps=hass.config_entries.async_reload
+    ) as reload:
+        result = await _redetect(hass, entry, new_bank, scan_interval=30)
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.data[CONF_CAPABILITIES]["has_wet_room_humidity"] is True
+    assert entry.options[CONF_SCAN_INTERVAL] == 30
+    assert reload.call_count == 1
+
+
+async def test_redetect_with_unchanged_capabilities_leaves_entry_data_alone(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    entry, _client = await async_setup_integration(rexo120_bank)
+    data_before = dict(entry.data)
+
+    with (
+        patch.object(
+            hass.config_entries, "async_reload", wraps=hass.config_entries.async_reload
+        ) as reload,
+        patch.object(
+            hass.config_entries,
+            "async_update_entry",
+            wraps=hass.config_entries.async_update_entry,
+        ) as update,
+    ):
+        result = await _redetect(hass, entry, rexo120_bank, scan_interval=10)
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert dict(entry.data) == data_before
+    assert all("data" not in call.kwargs for call in update.call_args_list)
+    assert reload.call_count == 0  # nothing changed at all
+
+
+async def test_redetect_against_a_non_parmair_endpoint_says_so(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    entry, _client = await async_setup_integration(rexo120_bank)
+    bad_bank = dict(rexo120_bank)
+    bad_bank[1244] = 0  # machine_type out of the 1..600 sanity range
+
+    result = await _redetect(hass, entry, bad_bank, scan_interval=10)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "not_parmair"}
