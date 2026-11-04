@@ -46,6 +46,26 @@ async def test_setup_creates_coordinator_and_registers_device(
     assert device.hw_version == "2.72"
 
 
+async def test_setup_uses_from_info_registration_when_available(
+    hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
+) -> None:
+    """HA 2026.11+ path: DeviceInfo is a dataclass, passed whole, not unpacked."""
+    calls: list[dict] = []
+
+    def fake_from_info(self, *, config_entry_id, device_info):
+        calls.append({"config_entry_id": config_entry_id, "device_info": device_info})
+
+    with patch.object(
+        dr.DeviceRegistry, "async_get_or_create_from_info", fake_from_info, create=True
+    ):
+        entry, _ = await async_setup_integration(rexo120_bank)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert len(calls) == 1
+    assert calls[0]["config_entry_id"] == entry.entry_id
+    assert calls[0]["device_info"] is entry.runtime_data.device_info
+
+
 async def test_unload_releases_the_modbus_client(
     hass: HomeAssistant, async_setup_integration, rexo120_bank: dict[int, int]
 ) -> None:

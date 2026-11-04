@@ -234,9 +234,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ParmairConfigEntry) -> b
     # device exists from setup on regardless of which entities get created
     # placeholders with no real entities yet to trigger it implicitly.
     if coordinator.device_info is not None:
-        dr.async_get(hass).async_get_or_create(
-            config_entry_id=entry.entry_id, **coordinator.device_info
-        )
+        registry = dr.async_get(hass)
+        if hasattr(registry, "async_get_or_create_from_info"):
+            # HA 2026.11+: DeviceInfo is a dataclass and can no longer be
+            # unpacked with ** (contributors blog 2026-10-13, "DeviceInfo is
+            # now a dataclass"). Drop the else branch once hacs.json requires
+            # 2026.11.
+            registry.async_get_or_create_from_info(
+                config_entry_id=entry.entry_id, device_info=coordinator.device_info
+            )
+        else:
+            registry.async_get_or_create(
+                config_entry_id=entry.entry_id, **coordinator.device_info
+            )
 
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
