@@ -244,9 +244,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ParmairConfigEntry) -> b
                 config_entry_id=entry.entry_id, device_info=coordinator.device_info
             )
         else:
-            registry.async_get_or_create(
-                config_entry_id=entry.entry_id, **coordinator.device_info
-            )
+            registry.async_get_or_create(config_entry_id=entry.entry_id, **coordinator.device_info)
 
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
