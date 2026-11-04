@@ -25,6 +25,13 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .coordinator import ParmairConfigEntry, ParmairCoordinator
 from .entity import ParmairEntity
 
+# HA 2026.11 renamed the device-unit climate properties to native_* (contributors
+# blog 2026-10-08, "Climate entities now expose their temperature unit"); the old
+# names log a deprecation warning and stop working in 2027.11. Core decides which
+# set exists, so implement whichever this core reads. Drop the old branch once
+# hacs.json requires 2026.11.
+_NATIVE_TEMPERATURES = hasattr(ClimateEntity, "native_current_temperature")
+
 _TEMPERATURE_MODE_TO_HVAC_ACTION: dict[int, HVACAction] = {
     0: HVACAction.IDLE,
     1: HVACAction.FAN,
@@ -71,7 +78,6 @@ class ParmairClimate(ParmairEntity, ClimateEntity):
 
     entity_description: ParmairClimateDescription
 
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_target_temperature_step = 0.5
     _attr_precision = PRECISION_TENTHS
     _attr_hvac_modes = [HVACMode.AUTO]
@@ -103,16 +109,33 @@ class ParmairClimate(ParmairEntity, ClimateEntity):
             return None
         return _TEMPERATURE_MODE_TO_HVAC_ACTION.get(int(mode))
 
-    @property
-    def current_temperature(self) -> float | None:
+    def _current_reading(self) -> float | None:
         data = self.coordinator.data
         if data is None:
             return None
         return data.get(self.entity_description.current_key)
 
-    @property
-    def target_temperature(self) -> float | None:
-        return self.register_value
+    if _NATIVE_TEMPERATURES:
+        _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+
+        @property
+        def native_current_temperature(self) -> float | None:
+            return self._current_reading()
+
+        @property
+        def native_target_temperature(self) -> float | None:
+            return self.register_value
+
+    else:
+        _attr_temperature_unit = UnitOfTemperature.CELSIUS
+
+        @property
+        def current_temperature(self) -> float | None:
+            return self._current_reading()
+
+        @property
+        def target_temperature(self) -> float | None:
+            return self.register_value
 
     async def async_set_temperature(self, **kwargs) -> None:
         temperature = kwargs.get(ATTR_TEMPERATURE)
