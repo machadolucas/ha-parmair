@@ -22,6 +22,3 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # No brand assets yet (repo-local or in home-assistant/brands) —
-          # see CLAUDE.md's Branding/icon section for the open TODO.
-          ignore: brands

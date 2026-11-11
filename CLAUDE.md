@@ -208,9 +208,17 @@ HACS reads both `manifest.json` and GitHub releases; a release is 4 steps:
 
 ## Branding / icon
 
-`brands/icon.svg` is repo-local; the HACS validate action runs with
-`ignore: brands`. TODO: submit to `home-assistant/brands` and drop the
-ignore.
+Home Assistant 2026.3 and newer load the bundled integration icon from
+`custom_components/parmair/brand/icon.png` (256 × 256) and
+`icon@2x.png` (512 × 512). The high-resolution artwork is kept at
+`brands/icon-master.png`; `brands/icon.svg` remains as legacy artwork.
+The root `brands/` directory is not the integration's runtime asset location.
+
+Local branding requires no submission to `home-assistant/brands` and no
+manifest icon override. Older Home Assistant versions retain their existing
+icon fallback; this cosmetic update does not raise the supported HA minimum
+in `hacs.json`. The current HACS brand validator accepts the bundled
+`brand/icon.png`, so the validation workflow no longer ignores `brands`.
 
 ## Open on-device verifications
 

@@ -286,6 +286,15 @@ internally — the integration handles the offset (matches the panel).
 - Download **diagnostics** from the device page and attach it to bug
   reports (the host is redacted).
 
+## Integration icon
+
+Home Assistant 2026.3 and newer use the bundled icon in
+[`custom_components/parmair/brand/`](custom_components/parmair/brand/).
+The package contains 256 px and 512 px PNGs; the high-resolution original is
+[`brands/icon-master.png`](brands/icon-master.png). Existing files under
+`brands/` are retained as legacy artwork. This cosmetic update leaves the
+integration's minimum Home Assistant version unchanged.
+
 ## Development
 
 ```bash
