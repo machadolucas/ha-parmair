@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 
+import _pure_imports  # noqa: F401 -- registers the isolated pure-module namespace
 import pytest
 from modbus_connection import (
     IllegalDataAddressError,
@@ -28,8 +29,10 @@ from modbus_connection import (
 )
 from modbus_connection.mock import MockModbusConnection, MockModbusUnit
 
-from custom_components.parmair import modbus
-from custom_components.parmair.modbus import ParmairConnectionError, ParmairModbusClient
+# isort: split
+
+from _parmair_unit import modbus
+from _parmair_unit.modbus import ParmairConnectionError, ParmairModbusClient
 
 # The Multi24's unit id; the mock does not care, but reading the real constant
 # keeps this file honest if it ever changes.

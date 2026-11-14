@@ -297,11 +297,28 @@ integration's minimum Home Assistant version unchanged.
 
 ## Development
 
+Validation on 2026-11-14: 256 full-suite tests passed with 94.73% coverage;
+108 standalone tests passed without Home Assistant. Ruff lint and formatting
+passed. Test Modbus pins match Core 2026.11.1: pymodbus 3.13.1,
+modbus-connection[tmodbus] 4.12.7 and tmodbus 1.1.0. Runtime files and installed
+v0.6.3 are unchanged; no real Modbus connection or device-control test was used.
+
+Modbus transport and capability tests use an isolated namespace pointing at
+the real source, without executing the HA integration initializer. The mock
+transport owns no real socket. HA tests retain their normal integration imports.
+
+The `uv.lock` environment is for development and tests only: Python is
+pinned to 3.14.10, and Home Assistant 2026.11.1 is selected by an explicit
+uv override because pytest-homeassistant-custom-component 0.13.375 declares
+HA 2026.10.4. The integration's HACS runtime minimum in `hacs.json` is
+unchanged. Root conftest loads Home Assistant and the plugin only when both
+are installed; otherwise pure tests remain runnable without Home Assistant. The
+compatibility shim for the plugin's removed logger helper raises if called.
+
 ```bash
-uv venv --python 3.14 .venv314
-uv pip install --python .venv314/bin/python -r requirements_test.txt
-.venv314/bin/python -m pytest --cov=custom_components/parmair --cov-fail-under=90
-.venv314/bin/ruff check . && .venv314/bin/ruff format --check .
+uv sync --locked
+uv run pytest --cov=custom_components/parmair --cov-fail-under=90
+uv run ruff check . && uv run ruff format --check .
 ```
 
 Pure logic (register map, capability detection, summer-mode state machine)

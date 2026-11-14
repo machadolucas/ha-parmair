@@ -139,16 +139,23 @@ Rules:
 
 ## Dev workflow
 
+The `uv.lock` environment is for development and tests only: Python is
+pinned to 3.14.10, and Home Assistant 2026.11.1 is selected by an explicit
+uv override because pytest-homeassistant-custom-component 0.13.375 declares
+HA 2026.10.4. The integration's HACS runtime minimum in `hacs.json` is
+unchanged. Root conftest loads Home Assistant and the plugin only when both
+are installed; otherwise pure tests remain runnable without Home Assistant. The
+compatibility shim for the plugin's removed logger helper raises if called.
+
 ```bash
-uv venv --python 3.14 .venv314          # HA requires >=3.14.2 as of 2026.8
-uv pip install --python .venv314/bin/python -r requirements_test.txt
-.venv314/bin/python -m pytest -q                        # full suite
-.venv314/bin/python -m pytest tests/test_registers.py  # pure only, no HA needed
-.venv314/bin/python -m pytest --cov=custom_components/parmair --cov-fail-under=90
-.venv314/bin/ruff check . && .venv314/bin/ruff format .
+uv sync --locked
+uv run pytest -q                        # full suite
+uv run pytest tests/test_registers.py  # pure only, no HA needed
+uv run pytest --cov=custom_components/parmair --cov-fail-under=90
+uv run ruff check . && uv run ruff format .
 ```
 
-`requirements_test.txt` mirrors core's `homeassistant/components/modbus/manifest.json`
+`pyproject.toml` and `uv.lock` mirror core's `homeassistant/components/modbus/manifest.json`
 pins (`pymodbus`, `modbus-connection[tmodbus]`, `tmodbus`): tests run with
 `skip_pip`, so nothing installs them for us even though `dependencies:
 ["modbus"]` makes HA import that component. Bump them in lockstep with core.
@@ -156,8 +163,8 @@ pins (`pymodbus`, `modbus-connection[tmodbus]`, `tmodbus`): tests run with
 ## Testing conventions
 
 - **Pure vs HA split**: `tests/test_*.py` are pure (plain pytest; modules
-  loaded under their dotted names via importlib — see `tests/conftest.py`;
-  root conftest must NOT import HA or load the HA plugin).
+  loaded directly or through the isolated `_parmair_unit` namespace. Root
+  conftest loads HA and its plugin only when both are installed).
   `tests/ha/test_*.py` use `pytest-homeassistant-custom-component`; the
   `auto_enable_custom_integrations` autouse fixture lives in
   `tests/ha/conftest.py`.

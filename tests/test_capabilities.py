@@ -1,36 +1,12 @@
-"""Unit tests for capability detection (no Home Assistant).
-
-capabilities.py has an internal relative import (``from .registers import
-...``), so — unlike the fully standalone test_registers.py — it's loaded
-under its *real* dotted module name; see tests/conftest.py for why that
-makes the relative import resolve.
-
-The base fixture values (static registers + probe) are a live probe of the
-user's REXO 120: heater_type=1 (electric), m10_sensor_type=1 (CO2), CO2
-probe reads 969 (fitted), wet-room-humidity and main-humidity probes read
-back the absent sentinel (None).
-"""
+"""Test capability parsing through the real source without importing Home Assistant."""
 
 from __future__ import annotations
 
-import importlib.util
-import pathlib
-import sys
+import _pure_imports  # noqa: F401 -- registers the isolated pure-module namespace
 
-_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_PATH = _ROOT / "custom_components" / "parmair" / "capabilities.py"
-_MODNAME = "custom_components.parmair.capabilities"
-_spec = importlib.util.spec_from_file_location(_MODNAME, _PATH)
-capabilities = importlib.util.module_from_spec(_spec)
-sys.modules[_MODNAME] = capabilities
-_spec.loader.exec_module(capabilities)
+# isort: split
 
-_registers_spec = importlib.util.spec_from_file_location(
-    "custom_components.parmair.registers", _ROOT / "custom_components" / "parmair" / "registers.py"
-)
-registers = importlib.util.module_from_spec(_registers_spec)
-sys.modules["custom_components.parmair.registers"] = registers
-_registers_spec.loader.exec_module(registers)
+from _parmair_unit import capabilities, registers
 
 Capabilities = capabilities.Capabilities
 parse_capabilities = capabilities.parse_capabilities
