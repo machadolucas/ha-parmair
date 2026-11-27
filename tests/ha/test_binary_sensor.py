@@ -129,7 +129,9 @@ async def test_cooking_detected_skips_poll_rewrites_and_volatile_attributes(
 ) -> None:
     """``cooking_detected`` carries a large, fast-changing attribute payload; it must
     neither be rewritten on every Modbus poll nor have that payload recorded."""
-    assert {"score", "sensors"} <= ParmairCookingDetectedBinarySensor._unrecorded_attributes
+    assert {"score", "onset_score", "sensors"} <= (
+        ParmairCookingDetectedBinarySensor._unrecorded_attributes
+    )
     assert "threshold" not in ParmairCookingDetectedBinarySensor._unrecorded_attributes
 
     entry = MockConfigEntry(

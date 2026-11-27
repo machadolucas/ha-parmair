@@ -96,6 +96,7 @@ from .const import (
 )
 from .cooking_detect import (
     DEFAULT_SIGMA_FLOOR,
+    PM_SIGMA_FLOOR,
     CookingDetector,
     CookingParams,
     CookingResult,
@@ -600,7 +601,14 @@ class ParmairCoordinator(DataUpdateCoordinator[ParmairData]):
         if device_class == "humidity" or unit == "%":
             return 1.0
         if unit in ("µg/m³", "μg/m³"):  # both micro-sign code points seen in the wild
-            return 1.0
+            # Low-cost optical PM sensors (SEN5x class) jitter by several µg/m³
+            # at indoor levels, and house air (people up and about, outdoor wood
+            # smoke) moves PM2.5 by 4-11 µg/m³ within a minute with nobody
+            # cooking. At 1.0 such a jump alone scored as a cook; the 2026-11
+            # kitchen replay cut empty-kitchen detection time by 40 % at 3.0
+            # (2.0 and 4.0 behaved alike) without losing a real cook. Frying
+            # moves PM by tens of µg/m³, far above it.
+            return PM_SIGMA_FLOOR
         if device_class == "carbon_dioxide" or unit == "ppm":
             return 25.0
         return DEFAULT_SIGMA_FLOOR

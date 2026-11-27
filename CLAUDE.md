@@ -74,7 +74,7 @@ via HACS from `machadolucas/ha-parmair`.
 | `registers.py` | pure | v1.87 register map, `build_read_plan()` block coalescing, `encode`/`decode` |
 | `capabilities.py` | pure | parse config registers 240–245 + probe sentinels → `Capabilities`; gates entities & read plan |
 | `summer_auto.py` | pure | dwell state machine for the summer-mode automation |
-| `cooking_detect.py` | pure | online per-sensor baselines (EMA + EW abs-residual, one-sided z, slope-z) fused into a hysteretic cooking detection; baselines freeze while active |
+| `cooking_detect.py` | pure | online per-sensor baselines (EMA + EW abs-residual, one-sided z, slope-z) fused into a hysteretic cooking detection; confirmation also needs the fused *onset* score (rise within `ONSET_WINDOW_S`) so slow drift can't start one; baselines freeze while active. Regression fixtures: `tests/fixtures/kitchen_cooking_traces_2026_11.json.gz` (real recorded false starts + cooks) |
 | `modbus.py` | modbus_connection only | `ParmairModbusClient`: thin adapter over a *borrowed* `ModbusUnit` — owns warm-up, retries, spacing, per-request timeout and error translation, but no socket. `create_client(unit)` factory is what tests patch |
 | `coordinator.py` | HA | `ParmairCoordinator`: block reads, static-once reads, partial-failure tolerance, write + optimistic update + delayed verify-read, repairs, summer-auto evaluation |
 | `config_flow.py` | HA | user → probe → confirm; options (scan interval, CO₂ offset, summer-auto source, re-detect). Borrows a temporary unit for both probe paths |

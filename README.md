@@ -140,9 +140,12 @@ the first fumes — no thresholds to tune per season:
 2. The integration learns a per-sensor baseline and noise level online
    (persisted across restarts) and scores each sample as a deviation from
    baseline, fusing all sensors: one strong spike triggers alone, two
-   moderate ones together. The baseline is frozen while cooking is detected
-   so long cooks can't blend into it, and re-learned automatically after
-   sensor reboots or outages.
+   moderate ones together. A detection only *starts* on a fast rise (within
+   about a minute), so a slow drift in the room's air — people up and about
+   elsewhere in the house, outdoor wood smoke drawn in by the ventilation —
+   can't trigger it by level alone. The baseline is frozen while cooking is
+   detected so long cooks can't blend into it, and re-learned automatically
+   after sensor reboots or outages.
 3. `binary_sensor.*_cooking_detected` turns on/off with the detection (its
    attributes show per-sensor baselines and z-scores; the diagnostic
    `Cooking score` sensor is graphable for tuning).
@@ -157,6 +160,11 @@ the first fumes — no thresholds to tune per season:
 If you'd rather keep boost decisions in your own automations (presence or
 time-of-day gating, arbitration with other boost causes), leave the switch
 off and trigger on the binary sensor instead.
+
+Kitchen air sensors usually sit near the kitchen extract, downstream of the
+whole house's air path, so they also see air from the rest of the house. If
+you have kitchen presence (a radar or PIR), requiring someone in the kitchen
+before acting on a detection removes almost all remaining false starts.
 
 ## Entities
 

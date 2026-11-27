@@ -21,6 +21,13 @@ Design choices worth stating up front, because they drive every constant below:
   the baseline is rebuilt from scratch and produces no evidence for a spell:
   an ESPHome reboot restarts the Sensirion index near 100 and re-baselines for
   minutes, which must not read as a spike.
+* **A detection starts on a fast rise, not on level alone.** Cooking pushes a
+  signal up within a minute. A slow drift (house air passing the kitchen
+  sensor at wake-up, outdoor wood smoke) can also carry the level above the
+  baseline, and a level-only trigger then froze the baseline below the drift
+  and held for the full ``MAX_ON_S``. So confirming a detection also needs the
+  *onset* score (each sensor's rise within ``ONSET_WINDOW_S``) to reach S_on;
+  once ON, the level holds the detection as before.
 
 The module is deliberately Home-Assistant-free: ``now`` is injected on every
 call and per-call tuning arrives in a :class:`CookingParams` (mirroring
@@ -109,6 +116,15 @@ GAP_RESET_S = 300.0
 SLOPE_WINDOW_S = 12.0
 SLOPE_MIN_SPAN_S = 4.0
 
+# Onset gate: OFF -> ON also needs the fused *onset* score (each sensor's rise
+# above its lowest value within the last ONSET_WINDOW_S, in sigma units, through
+# the same contribution curve) to reach S_on. Replayed on a week of the real
+# kitchen sensors (2026-11-20..27, VOC index + SEN55 humidity + PM2.5, labelled by
+# the kitchen radar/PIR/lights): 60 s halved the empty-kitchen onsets (44 -> 22)
+# and cut their time by two thirds while keeping every real cook. 45 s missed a
+# pasta boil (humidity rises slowly); 90 s let a third more drift through.
+ONSET_WINDOW_S = 60.0
+
 # Stuck-high escape hatch: after MAX_ON_S force OFF and, for REBASE_S, suppress
 # evidence while adapting ungated at TAU_FAST_S so mu snaps to the (possibly
 # still-elevated) level and a genuinely new cook can re-trigger via its slope.
@@ -134,6 +150,10 @@ RESTORE_MAX_AGE_S = 24.0 * 3600.0
 # Fallback sigma floor for a sensor we were never told about (the HA glue
 # classifies real floors from device_class/unit and calls set_sigma_floor).
 DEFAULT_SIGMA_FLOOR = 2.0
+
+# Noise floor the HA glue assigns to particulate sensors (µg/m³). Reasoning at
+# its use in ``coordinator._cooking_sigma_floor``.
+PM_SIGMA_FLOOR = 3.0
 
 # Guards max(dev, floor) against a zero/degenerate floor so z never divides by
 # zero even if a caller passes floor 0.
@@ -182,6 +202,8 @@ class _SensorState:
     last_value: float | None = None
     last_z: float = 0.0
     last_evidence: float = 0.0
+    onset_window: deque[tuple[datetime, float]] = field(default_factory=deque)
+    last_onset_evidence: float = 0.0
     needs_rewarm: bool = False
     restored_unverified: bool = False
     rebase_until: datetime | None = None
@@ -191,6 +213,11 @@ class _SensorState:
 def _clamp(value: float, low: float, high: float) -> float:
     """Clamp ``value`` into ``[low, high]``."""
     return max(low, min(high, value))
+
+
+def _contribution(evidence: float) -> float:
+    """Map one sensor's evidence (z units) onto its share of the fused score."""
+    return _clamp((evidence - Z_IGNORE) / (Z_STRONG - Z_IGNORE), 0.0, CONTRIB_CAP)
 
 
 class CookingDetector:
@@ -208,6 +235,7 @@ class CookingDetector:
         }
         self._active = False
         self._score = 0.0
+        self._onset_score = 0.0
         self._on_since: datetime | None = None
         self._arm_since: datetime | None = None
         self._off_since: datetime | None = None
@@ -225,6 +253,11 @@ class CookingDetector:
     def score(self) -> float:
         """The most recently computed fused score."""
         return self._score
+
+    @property
+    def onset_score(self) -> float:
+        """The most recently computed fused onset (fast-rise) score."""
+        return self._onset_score
 
     # -- configuration ------------------------------------------------------ #
 
@@ -266,8 +299,10 @@ class CookingDetector:
             st.available = False
             st.needs_rewarm = True
             st.window.clear()
+            st.onset_window.clear()
             st.last_value = None
             st.last_evidence = 0.0
+            st.last_onset_evidence = 0.0
             return self._evaluate(now, params)
 
         # Freeze reflects the detection state *as of this sample*, so a sample
@@ -318,12 +353,15 @@ class CookingDetector:
         st.last_t = now
         st.window.clear()
         st.window.append((now, x))
+        st.onset_window.clear()
+        st.onset_window.append((now, x))
         st.needs_rewarm = False
         st.restored_unverified = False
         st.rebase_until = None
         st.last_value = x
         st.last_z = 0.0
         st.last_evidence = 0.0
+        st.last_onset_evidence = 0.0
         st.available = True
 
     def _ingest(self, st: _SensorState, now: datetime, x: float, frozen: bool) -> None:
@@ -348,6 +386,7 @@ class CookingDetector:
             st.n = max(st.n, WARMUP_SAMPLES)
             st.last_t = now
             st.window.clear()
+            st.onset_window.clear()
         elif st.last_t is not None and (now - st.last_t).total_seconds() > GAP_RESET_S:
             # Continuity broke without an explicit unavailable — can't trust the
             # old baseline across the gap.
@@ -371,6 +410,18 @@ class CookingDetector:
         else:
             z_slope = 0.0
 
+        # Onset: rise above the lowest value of the last ONSET_WINDOW_S. Slow
+        # drift barely moves within a minute, so it scores here far below its
+        # level z.
+        st.onset_window.append((now, x))
+        while (
+            len(st.onset_window) > 1
+            and (now - st.onset_window[0][0]).total_seconds() > ONSET_WINDOW_S
+        ):
+            st.onset_window.popleft()
+        onset_low = min(v for _, v in st.onset_window)
+        z_onset = max(0.0, x - onset_low) / sigma
+
         warming = st.n < WARMUP_SAMPLES or (
             st.warm_start is not None and (now - st.warm_start).total_seconds() < WARMUP_S
         )
@@ -381,6 +432,7 @@ class CookingDetector:
         # No evidence while re-learning a baseline (warm-up) or deliberately
         # snapping to a stuck-high level (rebase).
         st.last_evidence = 0.0 if (warming or in_rebase) else min(max(z, z_slope), Z_CAP)
+        st.last_onset_evidence = 0.0 if (warming or in_rebase) else min(z_onset, Z_CAP)
 
         # Time-aware EMA. Rebase adapts ungated and fast to escape a stuck-high
         # baseline; otherwise adaptation is frozen during detection, reluctant
@@ -408,6 +460,7 @@ class CookingDetector:
         s_off = S_OFF_RATIO * s_on
 
         score = 0.0
+        onset_score = 0.0
         for st in self._sensors.values():
             # A sensor contributes only while available and fresh; a stale or
             # unavailable sensor is worth exactly zero (this is what lets an
@@ -418,21 +471,28 @@ class CookingDetector:
                 and (now - st.last_t).total_seconds() <= STALE_S
             ):
                 evidence = st.last_evidence
+                onset_evidence = st.last_onset_evidence
             else:
                 evidence = 0.0
-            contribution = _clamp((evidence - Z_IGNORE) / (Z_STRONG - Z_IGNORE), 0.0, CONTRIB_CAP)
-            score += contribution
+                onset_evidence = 0.0
+            score += _contribution(evidence)
+            onset_score += _contribution(onset_evidence)
         self._score = score
+        self._onset_score = onset_score
         self._last_eval = now
 
         transition: bool | None = None
 
         if not self._active:
             # OFF -> ON: score must hold >= S_on continuously; any dip re-arms.
+            # Confirmation also needs the onset score at S_on, so a level reached
+            # by slow drift (no fast rise anywhere) cannot start a detection.
             if score >= s_on:
                 if self._arm_since is None:
                     self._arm_since = now
-                elif (now - self._arm_since).total_seconds() >= ON_PERSIST_S:
+                elif (
+                    now - self._arm_since
+                ).total_seconds() >= ON_PERSIST_S and onset_score >= s_on:
                     self._active = True
                     self._on_since = now
                     self._arm_since = None
@@ -528,11 +588,13 @@ class CookingDetector:
             st.last_t = None
             st.warm_start = now - timedelta(seconds=WARMUP_S)
             st.window.clear()
+            st.onset_window.clear()
             st.rebase_until = None
             st.available = True
             st.last_value = None
             st.last_z = 0.0
             st.last_evidence = 0.0
+            st.last_onset_evidence = 0.0
 
     def diagnostics(self, now: datetime) -> dict[str, dict]:
         """Per-sensor snapshot for the binary sensor's attributes."""
@@ -557,6 +619,7 @@ class CookingDetector:
                 "sigma": round(sigma, 3),
                 "z": round(st.last_z, 3),
                 "evidence": round(st.last_evidence, 3),
+                "onset": round(st.last_onset_evidence, 3),
                 "status": status,
             }
         return out

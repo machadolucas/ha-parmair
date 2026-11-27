@@ -214,6 +214,7 @@ async def test_detection_end_to_end(
     assert hass.states.get(bs_id).state == "on"
     attrs = hass.states.get(bs_id).attributes
     assert "score" in attrs and "threshold" in attrs and "sensors" in attrs
+    assert "onset_score" in attrs
     assert VOC in attrs["sensors"]
     assert attrs["threshold"] == 1.0  # 5 / default sensitivity 5
     assert float(hass.states.get(score_id).state) > 0.0
@@ -642,3 +643,25 @@ async def test_steady_sensor_reports_keep_the_baseline_warm(
         await hass.async_block_till_done()
 
     assert coordinator.cooking_active is True
+
+
+async def test_particulate_sensor_gets_pm_sigma_floor(
+    hass: HomeAssistant, rexo120_bank, rexo120_capabilities_dict
+) -> None:
+    """A µg/m³ source is classified with PM_SIGMA_FLOOR, humidity keeps 1.0.
+
+    House air moves indoor PM2.5 by several µg/m³ with nobody cooking; at the old
+    1.0 floor that jump alone scored as a cook (see coordinator reasoning).
+    """
+    from custom_components.parmair.cooking_detect import PM_SIGMA_FLOOR
+
+    pm, hum = "sensor.test_pm25", "sensor.test_humidity"
+    hass.states.async_set(pm, "12.0", {"unit_of_measurement": "µg/m³"})
+    hass.states.async_set(hum, "20.0", {"unit_of_measurement": "%", "device_class": "humidity"})
+    entry, _fake = await _setup_cooking(
+        hass, rexo120_bank, rexo120_capabilities_dict, [VOC, pm, hum]
+    )
+    sensors = entry.runtime_data.cooking_detector._sensors
+    assert PM_SIGMA_FLOOR == 3.0
+    assert sensors[pm].sigma_floor == PM_SIGMA_FLOOR
+    assert sensors[hum].sigma_floor == 1.0

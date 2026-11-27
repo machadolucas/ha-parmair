@@ -136,7 +136,7 @@ class ParmairCookingDetectedBinarySensor(ParmairCookingEntity, BinarySensorEntit
     # event; recording them would write a fresh attributes row per event (the
     # score has its own recorded sensor anyway). ``threshold`` only moves with
     # the sensitivity setting, so it stays in history as context.
-    _unrecorded_attributes = frozenset({"score", "sensors"})
+    _unrecorded_attributes = frozenset({"score", "onset_score", "sensors"})
 
     def __init__(self, coordinator: ParmairCoordinator) -> None:
         super().__init__(coordinator, "cooking_detected")
@@ -153,6 +153,7 @@ class ParmairCookingDetectedBinarySensor(ParmairCookingEntity, BinarySensorEntit
         sensors = detector.diagnostics(dt_util.utcnow()) if detector is not None else {}
         return {
             "score": round(self.coordinator.cooking_score, 2),
+            "onset_score": round(detector.onset_score, 2) if detector is not None else 0.0,
             "threshold": round(threshold, 2),
             "sensors": sensors,
         }

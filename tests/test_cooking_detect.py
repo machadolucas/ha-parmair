@@ -7,11 +7,15 @@ replays a real VOC-index trace captured from the kitchen sensor on 2026-07-18.
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
+import json
 import math
 import pathlib
 import sys
 from datetime import datetime, timedelta
+
+import pytest
 
 _PATH = (
     pathlib.Path(__file__).resolve().parents[1]
@@ -542,9 +546,16 @@ def test_arming_does_not_survive_a_stale_gap():
     assert second.transition is None
     assert not det.active
 
-    # A genuine hold from the second spike still turns it on.
+    # Holding that level after the silence is not a fast rise either: the onset
+    # gate (ONSET_WINDOW_S) has seen no rise within the last minute.
     third = det.update(t + _sec(106.0), VOC, 122.0, DEFAULTS)
-    assert third.transition is True
+    assert third.transition is None
+    assert not det.active
+
+    # A genuine new rise from baseline still turns it on.
+    t2, _ = _feed(det, VOC, t + _sec(108.0), [80] * 40)
+    _, rise = _feed(det, VOC, t2 + _sec(2.0), [120, 122, 124, 124])
+    assert _first_on(rise) is not None
 
 
 def test_arming_survives_a_gap_shorter_than_stale():
@@ -593,3 +604,127 @@ def test_restore_skips_sensors_no_longer_configured():
     )
     assert HUM not in det.diagnostics(T0)
     assert HUM not in det.snapshot(T0)["sensors"]
+
+
+# --------------------------------------------------------------------------- #
+# Onset gate: a detection starts on a fast rise, not on drifted level alone
+# --------------------------------------------------------------------------- #
+
+
+def _drift(det: CookingDetector, start: datetime, rate_per_min: float, minutes: float):
+    """Flat noisy VOC baseline, then a steady drift; returns (last_t, ever_active)."""
+    noise = [80, 81, 79, 80, 82, 80, 78, 80]
+    t = start
+    for i in range(300):  # 10 min baseline
+        det.update(t, VOC, noise[i % 8], DEFAULTS)
+        t += _sec(2.0)
+    level, ever = 80.0, False
+    for i in range(int(minutes * 30)):
+        level += rate_per_min / 30.0
+        det.update(t, VOC, round(level) + (noise[i % 8] - 80), DEFAULTS)
+        ever = ever or det.active
+        t += _sec(2.0)
+    return t, ever
+
+
+def test_moderate_drift_without_fast_rise_does_not_trigger():
+    # +4 index/min (the house-air VOC drift in fp_house_air_voc_drift) carries
+    # the level well above a 300 s baseline (level z > Z_STRONG), which used to
+    # start a detection after ~2.7 min. It never rises fast within a minute.
+    det = _voc_detector()
+    t, ever = _drift(det, T0, rate_per_min=4.0, minutes=10)
+    assert not ever
+    assert det.diagnostics(t)[VOC]["z"] > cooking_detect.Z_STRONG  # level alone would trigger
+    assert det.diagnostics(t)[VOC]["onset"] < cooking_detect.Z_STRONG
+
+
+def test_fast_rise_still_triggers_through_onset_gate():
+    # +6 index/min is a real (if gentle) cooking ramp: the minute-scale rise
+    # clears the onset gate.
+    _, ever = _drift(_voc_detector(), T0, rate_per_min=6.0, minutes=5)
+    assert ever
+
+
+def test_onset_score_tracks_fast_rise_and_is_exposed():
+    det = _voc_detector()
+    t, _ = _feed(det, VOC, T0, [80] * 80)
+    assert det.onset_score == 0.0
+    _feed(det, VOC, t + _sec(2.0), [80, 120, 120])
+    assert det.onset_score > 0.0
+    assert det.diagnostics(t + _sec(6.0))[VOC]["onset"] > cooking_detect.Z_STRONG
+
+
+def test_unavailable_clears_onset_evidence():
+    det = _voc_detector()
+    t, _ = _feed(det, VOC, T0, [80] * 80)
+    det.update(t + _sec(2.0), VOC, 120, DEFAULTS)
+    det.update(t + _sec(4.0), VOC, None, DEFAULTS)
+    assert det.diagnostics(t + _sec(4.0))[VOC]["onset"] == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Recorded kitchen traces (2026-11, SEN55 VOC index + humidity + PM2.5)
+# --------------------------------------------------------------------------- #
+#
+# Each case is 38 min of the real kitchen sensors from the HA recorder: 30 min
+# before the moment the previous detector (v0.6.x) started a detection, then
+# 8 min after (absolute times dropped; offsets only). Points are state changes
+# ([seconds from start, value], None = unavailable); unchanged re-reports are
+# refilled every 5 s like EVENT_STATE_REPORTED does live. "fp_" cases had nobody
+# in the kitchen (radar, PIR and lights all quiet): house air at wake-up and
+# outdoor wood smoke. "cook_" cases are real cooking with someone at the stove.
+# Sigma floors are the ones the HA glue assigns (VOC 2.0, humidity 1.0, PM 3.0).
+
+_TRACES_PATH = (
+    pathlib.Path(__file__).resolve().parent / "fixtures" / "kitchen_cooking_traces_2026_11.json.gz"
+)
+
+
+def _load_traces() -> dict:
+    with gzip.open(_TRACES_PATH, "rt", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+_TRACES = _load_traces()
+
+
+def _replay_trace(case: dict) -> tuple[bool, bool]:
+    """Replay one recorded case; return (ever_active, active one min after reference)."""
+    floors = {"voc": 2.0, "humidity": 1.0, "pm25": cooking_detect.PM_SIGMA_FLOOR}
+    det = CookingDetector({k: SensorSpec(sigma_floor=f) for k, f in floors.items()})
+    start = datetime(2026, 1, 1, 12, 0)  # cases carry relative offsets only
+    end = start + timedelta(minutes=38)
+    events = []
+    for key, points in case["sensors"].items():
+        for i, (offset, value) in enumerate(points):
+            t = start + _sec(offset)
+            events.append((t, key, value))
+            nxt = start + _sec(points[i + 1][0]) if i + 1 < len(points) else end
+            refill = t + _sec(5.0)
+            while value is not None and refill < nxt:
+                events.append((refill, key, value))
+                refill += _sec(5.0)
+    events.sort(key=lambda e: e[0])
+    ever, at_ref = False, None
+    reference = start + timedelta(minutes=31.5)
+    for t, key, value in events:
+        det.update(t, key, value, DEFAULTS)
+        ever = ever or det.active
+        if at_ref is None and t >= reference:
+            at_ref = det.active
+    return ever, bool(at_ref)
+
+
+@pytest.mark.parametrize("name", sorted(n for n in _TRACES if n.startswith("fp_")))
+def test_recorded_house_air_does_not_trigger(name):
+    ever, _ = _replay_trace(_TRACES[name])
+    assert not ever, f"{name}: empty-kitchen house air started a detection"
+
+
+@pytest.mark.parametrize("name", sorted(n for n in _TRACES if n.startswith("cook_")))
+def test_recorded_cooking_still_triggers(name):
+    # cook_pasta_boil is the edge case: humidity-led, slower
+    # than frying, and the reason the onset gate checks at confirmation (not
+    # throughout the 3 s arming) and the window is 60 s rather than 45 s.
+    ever, at_ref = _replay_trace(_TRACES[name])
+    assert ever and at_ref, f"{name}: real cooking was not detected"
